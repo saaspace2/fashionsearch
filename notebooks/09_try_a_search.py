@@ -26,6 +26,7 @@
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config, table
+from fashionsearch import registry
 
 cfg = load_config()
 
@@ -98,8 +99,10 @@ mlflow.set_registry_uri("databricks-uc")
 ALIAS = cfg.registry.aliases.champion
 
 # Both models are pyfunc: image bytes in, a DataFrame out. No transformers here.
-encoder = mlflow.pyfunc.load_model(f"models:/{cfg.registry.encoder_model}@{ALIAS}")
-detector = mlflow.pyfunc.load_model(f"models:/{cfg.registry.detector_model}@{ALIAS}")
+encoder = mlflow.pyfunc.load_model(
+    registry.resolve(cfg, cfg.registry.encoder_model, ALIAS))
+detector = mlflow.pyfunc.load_model(
+    registry.resolve(cfg, cfg.registry.detector_model, ALIAS))
 
 
 def detect(image_path):

@@ -1,26 +1,32 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 04 — Register in Unity Catalog
+# MAGIC # 04 — Register the models
 # MAGIC
-# MAGIC Takes the models logged in notebook 03 and registers them as versioned UC
-# MAGIC models. **No alias is set here.** A freshly registered version is just a
-# MAGIC numbered artifact; only the gate in notebook 06 may tag `@candidate`, and
-# MAGIC only a human moves `@shadow` → `@production`.
+# MAGIC Registers what notebook 03 logged, so later notebooks can ask for
+# MAGIC "the current champion" rather than hardcoding a run id.
 # MAGIC
-# MAGIC That separation is the whole point. If registration also promoted, there
-# MAGIC would be nothing standing between "it ran" and "users see it".
+# MAGIC **No alias is set by the gate's rules here.** A freshly registered version
+# MAGIC is just a numbered artifact. Only the gate in notebook 06 may tag
+# MAGIC `@candidate`, and only a human moves `@shadow` → `@production`.
+# MAGIC
+# MAGIC ## If Unity Catalog registration fails
+# MAGIC
+# MAGIC It will, on Databricks Free Edition. Registering to UC copies artifacts
+# MAGIC into UC managed storage, which needs dedicated (single-user) compute, and
+# MAGIC Free Edition is serverless-only. You get an S3 AccessDenied.
+# MAGIC
+# MAGIC The pipeline does not stop. `fashionsearch.registry` falls back to a Delta
+# MAGIC pointer table holding name, version, alias and run URI. You lose UC
+# MAGIC governance; you keep versions, aliases and the audit trail the gate needs.
+# MAGIC The notebook prints which mode it used.
 
 # COMMAND ----------
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config
+from fashionsearch import registry
 
 cfg = load_config()
-
-import mlflow
-from mlflow.tracking import MlflowClient
-mlflow.set_registry_uri("databricks-uc")
-client = MlflowClient()
 
 # COMMAND ----------
 try:
@@ -32,48 +38,46 @@ except Exception:
     encoder_uri = dbutils.widgets.get("encoder_uri")
     detector_uri = dbutils.widgets.get("detector_uri")
 
-print(encoder_uri, detector_uri, sep="\n")
+print("encoder :", encoder_uri)
+print("detector:", detector_uri)
+assert encoder_uri and detector_uri, "Run notebook 03 first — it produces both URIs."
 
 # COMMAND ----------
-def register(uri: str, name: str, description: str):
-    version = mlflow.register_model(model_uri=uri, name=name)
-    client.update_registered_model(name=name, description=description)
-    client.set_model_version_tag(name, version.version, "source", "huggingface")
-    client.set_model_version_tag(name, version.version, "gate_status", "not_evaluated")
-    print(f"{name} -> version {version.version}")
-    return version
-
-enc = register(
-    encoder_uri, cfg.registry.encoder_model,
+enc = registry.register(
+    cfg, encoder_uri, cfg.registry.encoder_model,
     "Fashion image encoder. Swin backbone + 128-d projection, L2-normalised. "
     "Imported from yainage90/fashion-image-feature-extractor, not trained here.")
 
-det = register(
-    detector_uri, cfg.registry.detector_model,
-    "Fashion object detector, 7 categories. Imported from "
+det = registry.register(
+    cfg, detector_uri, cfg.registry.detector_model,
+    "Fashion object detector, 7 categories, logged as pyfunc. Imported from "
     "yainage90/fashion-object-detection.")
+
+print(f"\nregistration mode: {enc['mode']}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Bootstrap only: the first version becomes the champion
+# MAGIC ## Bootstrap the champion
 # MAGIC
-# MAGIC With no champion there is nothing to compare against, so the gate has no
-# MAGIC baseline. On a completely empty registry we set `@production` once, so
-# MAGIC that every subsequent version faces a real comparison.
+# MAGIC With no champion there is nothing for the gate to compare against, so on a
+# MAGIC completely empty registry the first version becomes champion. Every version
+# MAGIC after that faces a real comparison.
 
 # COMMAND ----------
-for model_name, version in [(cfg.registry.encoder_model, enc),
-                            (cfg.registry.detector_model, det)]:
+CHAMPION = cfg.registry.aliases.champion
+
+for name, result in [(cfg.registry.encoder_model, enc),
+                     (cfg.registry.detector_model, det)]:
     try:
-        current = client.get_model_version_by_alias(
-            model_name, cfg.registry.aliases.champion)
-        print(f"{model_name}: champion is already v{current.version} — leaving it")
-    except Exception:
-        client.set_registered_model_alias(
-            model_name, cfg.registry.aliases.champion, version.version)
-        print(f"{model_name}: bootstrapped @{cfg.registry.aliases.champion} "
-              f"= v{version.version}")
+        existing = registry.resolve(cfg, name, CHAMPION)
+        print(f"{name}: champion already set ({existing}) — leaving it")
+    except SystemExit:
+        registry.set_alias(cfg, name, CHAMPION, result["version"])
+        print(f"{name}: bootstrapped @{CHAMPION} = v{result['version']}")
 
 # COMMAND ----------
-dbutils.jobs.taskValues.set("encoder_version", enc.version)
-dbutils.jobs.taskValues.set("detector_version", det.version)
+if enc["mode"] == "fallback":
+    display(spark.table(f"{cfg.catalog.name}.ml.model_pointers"))
+
+dbutils.jobs.taskValues.set("encoder_version", enc["version"])
+dbutils.jobs.taskValues.set("detector_version", det["version"])

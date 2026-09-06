@@ -15,6 +15,7 @@ sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config, table, ensure_experiment
 from fashionsearch.metrics import evaluate_query
 from fashionsearch.promotion import evaluate_gate
+from fashionsearch import registry
 
 cfg = load_config()
 
@@ -111,16 +112,15 @@ display(spark.createDataFrame(slice_metrics))
 # MAGIC %md ## The gate
 
 # COMMAND ----------
-version = client.get_registered_model(cfg.registry.encoder_model).latest_versions[0]
+encoder_version = registry.latest_version(cfg, cfg.registry.encoder_model)
 
 # Champion baseline: the last recorded run for whichever version currently holds
 # @production. On a first run there is none, so every slice compares to zero.
 champ_rows = []
 try:
-    champ = client.get_model_version_by_alias(cfg.registry.encoder_model,
-                                              cfg.registry.aliases.champion)
+    champ_version = registry.latest_version(cfg, cfg.registry.encoder_model)
     hist = spark.table(table(cfg, "gold", "retrieval_metrics")) \
-        .filter(F.col("model_version") == str(champ.version))
+        .filter(F.col("model_version") == str(champ_version))
     if hist.count():
         latest_run = hist.agg(F.max("evaluated_at")).first()[0]
         champ_rows = hist.filter(F.col("evaluated_at") == latest_run).toPandas() \
@@ -132,7 +132,7 @@ report = evaluate_gate(slice_metrics.to_dict("records"), champ_rows, dict(cfg.ga
 print(report.render())
 
 # COMMAND ----------
-with mlflow.start_run(run_name=f"gate-encoder-v{version.version}") as run:
+with mlflow.start_run(run_name=f"gate-encoder-v{encoder_version}") as run:
     mlflow.log_metrics({f"overall_{c}": overall[c] for c in metric_cols})
     for v in report.verdicts:
         mlflow.log_metric(f"gate.{v.name}", v.observed)
@@ -142,23 +142,23 @@ with mlflow.start_run(run_name=f"gate-encoder-v{version.version}") as run:
 
 (spark.createDataFrame(slice_metrics)
  .withColumn("model_name", F.lit(cfg.registry.encoder_model))
- .withColumn("model_version", F.lit(str(version.version)))
+ .withColumn("model_version", F.lit(str(encoder_version)))
  .withColumn("evaluated_at", F.current_timestamp())
  .withColumn("gate_passed", F.lit(report.passed))
  .write.mode("append").saveAsTable(table(cfg, "gold", "retrieval_metrics")))
 
 # COMMAND ----------
 if not report.passed:
-    client.set_model_version_tag(cfg.registry.encoder_model, version.version,
-                                 "gate_status", "FAILED")
+    registry.set_tag(cfg, cfg.registry.encoder_model, encoder_version,
+                     "gate_status", "FAILED")
     raise Exception(
         f"Promotion blocked: {', '.join(report.failures)}. Per-slice detail in "
         f"{table(cfg, 'gold', 'retrieval_metrics')} "
-        f"(model_version={version.version}).")
+        f"(model_version={encoder_version}).")
 
-client.set_registered_model_alias(cfg.registry.encoder_model,
-                                  cfg.registry.aliases.candidate, version.version)
-client.set_model_version_tag(cfg.registry.encoder_model, version.version,
-                             "gate_status", "PASSED")
-print(f"v{version.version} tagged @{cfg.registry.aliases.candidate}. "
+registry.set_alias(cfg, cfg.registry.encoder_model,
+                   cfg.registry.aliases.candidate, encoder_version)
+registry.set_tag(cfg, cfg.registry.encoder_model, encoder_version,
+                 "gate_status", "PASSED")
+print(f"v{encoder_version} tagged @{cfg.registry.aliases.candidate}. "
       f"Promotion to @shadow and @production stays a human decision.")

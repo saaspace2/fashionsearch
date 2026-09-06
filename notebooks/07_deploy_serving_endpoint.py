@@ -30,6 +30,34 @@ w = WorkspaceClient()
 client = MlflowClient()
 
 # COMMAND ----------
+# MAGIC %md
+# MAGIC ## Requirements check
+# MAGIC
+# MAGIC This notebook needs two things Free Edition does not provide: models
+# MAGIC registered in Unity Catalog, and Databricks Model Serving. It is not part
+# MAGIC of `fashion_pipeline` for that reason.
+# MAGIC
+# MAGIC If you are on Free Edition, skip it. The pipeline is complete without it:
+# MAGIC notebook 05 embeds the catalogue in batch and notebook 09 runs searches
+# MAGIC interactively, which is what you need to see the system working. A serving
+# MAGIC endpoint only matters once a real application is calling it.
+
+# COMMAND ----------
+from fashionsearch import registry
+
+try:
+    from mlflow.tracking import MlflowClient as _C
+    mlflow.set_registry_uri("databricks-uc")
+    _C().get_registered_model(cfg.registry.encoder_model)
+except Exception as exc:
+    raise SystemExit(
+        f"{cfg.registry.encoder_model} is not in Unity Catalog: {exc}\n\n"
+        f"Notebook 04 fell back to the pointer table, which means UC model "
+        f"registration is unavailable on this workspace. Model Serving requires "
+        f"UC, so this notebook cannot run here.\n\n"
+        f"Use notebook 09 instead — it runs real searches and shows the results.")
+
+# COMMAND ----------
 dbutils.widgets.dropdown("alias", "candidate", ["candidate", "shadow", "production"])
 ALIAS = dbutils.widgets.get("alias")
 

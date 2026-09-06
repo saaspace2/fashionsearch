@@ -18,6 +18,7 @@
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config, table
+from fashionsearch import registry
 
 cfg = load_config()
 
@@ -25,8 +26,10 @@ import mlflow, base64, io
 import numpy as np, pandas as pd
 from pyspark.sql import functions as F, types as T
 
-mlflow.set_registry_uri("databricks-uc")
-ENCODER = f"models:/{cfg.registry.encoder_model}@{cfg.registry.aliases.champion}"
+# Resolved through the registry helper so this works whether the models live in
+# Unity Catalog or in the pointer-table fallback.
+CHAMPION = cfg.registry.aliases.champion
+ENCODER = registry.resolve(cfg, cfg.registry.encoder_model, CHAMPION)
 
 # COMMAND ----------
 # MAGIC %md ## Embed the catalogue
@@ -74,7 +77,7 @@ embeddings = (products.repartition(max(1, n // 500))
        .select("product_id", "category", "in_stock", "region", "brand", "price"),
        "product_id")
  .withColumn("embedded_at", F.current_timestamp())
- .withColumn("encoder_alias", F.lit(cfg.registry.aliases.champion))
+ .withColumn("encoder_alias", F.lit(CHAMPION))
  .write.mode("overwrite").option("overwriteSchema", "true")
  .saveAsTable(table(cfg, "silver", "product_embeddings")))
 
@@ -152,7 +155,7 @@ def make_query_processor(encoder_uri, detector_uri):
     return process
 
 
-DETECTOR = f"models:/{cfg.registry.detector_model}@{cfg.registry.aliases.champion}"
+DETECTOR = registry.resolve(cfg, cfg.registry.detector_model, CHAMPION)
 
 queries = spark.table(table(cfg, "gold", "eval_queries")).select("post_id", "query_image")
 q_out = (queries.repartition(8)
