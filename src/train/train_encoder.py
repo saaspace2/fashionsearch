@@ -181,7 +181,7 @@ def main():
             out = model(torch.from_numpy(example)).numpy()
 
         info = mlflow.pytorch.log_model(
-            pytorch_model=model, name="encoder",
+            pytorch_model=model, artifact_path="encoder",
             signature=infer_signature(example, out),
             input_example=example,
             registered_model_name=args.model_name,

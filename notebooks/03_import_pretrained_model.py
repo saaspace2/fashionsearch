@@ -23,6 +23,7 @@
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config, ensure_experiment
+from fashionsearch.compat import log_model
 
 cfg = load_config()
 
@@ -133,15 +134,14 @@ with mlflow.start_run(run_name="import-encoder") as run:
         "image_size": encoder_config.image_size,
         "trained_by": "yainage90 (imported, not trained here)",
     })
-    info = mlflow.pyfunc.log_model(
-        name="encoder",
+    encoder_uri = log_model(
+        mlflow.pyfunc, "encoder",
         python_model=EncoderWrapper(),
         artifacts={"model": model_path},
         signature=infer_signature(example, output_example),
         input_example=example,
         pip_requirements=["torch", "torchvision", "transformers", "pillow"],
     )
-    encoder_uri = info.model_uri
     print("logged", encoder_uri)
 
 # COMMAND ----------
@@ -158,12 +158,11 @@ print("categories:", detector.config.id2label)
 with mlflow.start_run(run_name="import-detector") as run:
     mlflow.log_params({"source": DET_CKPT,
                        "n_classes": len(detector.config.id2label)})
-    det_info = mlflow.transformers.log_model(
+    detector_uri = log_model(
+        mlflow.transformers, "detector",
         transformers_model={"model": detector, "image_processor": det_processor},
-        name="detector",
         task="object-detection",
     )
-    detector_uri = det_info.model_uri
     print("logged", detector_uri)
 
 # COMMAND ----------
