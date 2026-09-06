@@ -2,23 +2,28 @@
 # MAGIC %md
 # MAGIC # 05 — Batch inference
 # MAGIC
-# MAGIC Embeds the whole catalogue with the registered encoder and writes the
-# MAGIC vectors to Delta. Also runs the detector over the eval query images so
-# MAGIC that notebook 06 can label each query with a `size_band` and `occlusion`
-# MAGIC slice — those labels are what turn one number into a diagnosis.
+# MAGIC Embeds the catalogue and the eval queries, and records the `size_band`
+# MAGIC slice label that lets notebook 06 score small items separately.
 # MAGIC
-# MAGIC On CPU this is the slow step. Roughly 8–15 images/second, so 2000 products
-# MAGIC takes a few minutes. Scale `sample_size` in `config.yaml` accordingly.
+# MAGIC ## Why this runs on the driver, not across executors
+# MAGIC
+# MAGIC An earlier version used `mapInPandas` so Spark could parallelise. It failed:
+# MAGIC `mlflow.pyfunc.load_model()` inside an executor downloads artifacts relative
+# MAGIC to the working directory, which on serverless is the read-only workspace.
+# MAGIC
+# MAGIC That is fixable with a writable `dst_path`, but the shape was wrong anyway.
+# MAGIC Distributing means every executor downloads a 348 MB model before doing any
+# MAGIC work — for 2,000 images the download dominates. A plain driver loop loads
+# MAGIC each model once and is both simpler and faster at this size.
+# MAGIC
+# MAGIC **This does not scale to two million products.** At that point you want
+# MAGIC `mapInPandas` with `dst_path="/local_disk0/model"` and a GPU. The trade is
+# MAGIC deliberate and worth revisiting when `sample_size` grows past ~50,000.
 
 # COMMAND ----------
 # MAGIC %md
 # MAGIC Dependencies come from the job's `environments:` block in
-# MAGIC `resources/jobs_pipeline.yml`. Deliberately no `%pip install` here:
-# MAGIC installing again inside the notebook makes serverless build and cache a
-# MAGIC per-session environment archive, and a missing archive fails the run with
-# MAGIC `ENVIRONMENT_DOWNLOAD_USER_ERROR.NOT_FOUND`.
-# MAGIC
-# MAGIC To run this notebook interactively instead, install them by hand first.
+# MAGIC `resources/jobs_pipeline.yml`. Deliberately no `%pip install` here.
 
 # COMMAND ----------
 import sys, pathlib
@@ -28,57 +33,87 @@ from fashionsearch import registry
 
 cfg = load_config()
 
-import mlflow, base64, io
-import numpy as np, pandas as pd
+import base64, io, time
+import numpy as np
+import pandas as pd
+import mlflow
+from PIL import Image
 from pyspark.sql import functions as F, types as T
 
-# Resolved through the registry helper so this works whether the models live in
-# Unity Catalog or in the pointer-table fallback.
 CHAMPION = cfg.registry.aliases.champion
 ENCODER = registry.resolve(cfg, cfg.registry.encoder_model, CHAMPION)
+DETECTOR = registry.resolve(cfg, cfg.registry.detector_model, CHAMPION)
+
+# Load once, on the driver, into a writable location.
+encoder = mlflow.pyfunc.load_model(ENCODER)
+detector = mlflow.pyfunc.load_model(DETECTOR)
+print("both models loaded")
+
+# COMMAND ----------
+# MAGIC %md ## Helpers
+
+# COMMAND ----------
+def b64_of(path: str) -> str:
+    with open(path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode()
+
+
+def b64_of_image(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def embed_batch(b64_list):
+    """Encoder returns a DataFrame of shape (n, 128)."""
+    out = encoder.predict(pd.DataFrame({"image": b64_list}))
+    return np.asarray(out, dtype=np.float32)
+
+
+def progress(done, total, started, label):
+    """Long steps look hung without this. Print every 200 items."""
+    if done % 200 and done != total:
+        return
+    elapsed = time.time() - started
+    rate = done / elapsed if elapsed else 0
+    remaining = (total - done) / rate if rate else 0
+    print(f"  {label}: {done}/{total}  {rate:.1f}/s  ~{remaining/60:.1f} min left")
 
 # COMMAND ----------
 # MAGIC %md ## Embed the catalogue
 
 # COMMAND ----------
-EMB_SCHEMA = T.StructType([
-    T.StructField("product_id", T.StringType()),
-    T.StructField("embedding", T.ArrayType(T.FloatType())),
-])
+products = (spark.table(table(cfg, "bronze", "products"))
+            .select("product_id", "image_path").toPandas())
+print(f"embedding {len(products)} products")
 
+BATCH = 16
+ids, vecs = [], []
+started = time.time()
 
-def make_embedder(model_uri, batch_size=32):
-    def embed(iterator):
-        model = mlflow.pyfunc.load_model(model_uri)
-        for pdf in iterator:
-            ids, vecs = [], []
-            for start in range(0, len(pdf), batch_size):
-                chunk = pdf.iloc[start:start + batch_size]
-                b64, kept = [], []
-                for r in chunk.itertuples():
-                    try:
-                        with open(r.image_path, "rb") as fh:
-                            b64.append(base64.b64encode(fh.read()).decode())
-                        kept.append(r.product_id)
-                    except Exception:
-                        continue
-                if not b64:
-                    continue
-                out = model.predict(pd.DataFrame({"image": b64}))
-                ids.extend(kept)
-                vecs.extend(np.asarray(out, dtype=np.float32).tolist())
-            yield pd.DataFrame({"product_id": ids, "embedding": vecs})
-    return embed
+for start in range(0, len(products), BATCH):
+    chunk = products.iloc[start:start + BATCH]
+    payload, kept = [], []
+    for r in chunk.itertuples():
+        try:
+            payload.append(b64_of(r.image_path))
+            kept.append(r.product_id)
+        except Exception:
+            continue          # a missing file should not kill the run
+    if not payload:
+        continue
+    emb = embed_batch(payload)
+    ids.extend(kept)
+    vecs.extend(emb.tolist())
+    progress(len(ids), len(products), started, "catalogue")
 
+print(f"embedded {len(ids)} products in {(time.time()-started)/60:.1f} min")
 
-products = spark.table(table(cfg, "bronze", "products")).select("product_id", "image_path")
-n = products.count()
-print(f"embedding {n} products")
+# COMMAND ----------
+emb_df = spark.createDataFrame(
+    pd.DataFrame({"product_id": ids, "embedding": vecs}))
 
-embeddings = (products.repartition(max(1, n // 500))
-              .mapInPandas(make_embedder(ENCODER), schema=EMB_SCHEMA))
-
-(embeddings
+(emb_df
  .join(spark.table(table(cfg, "bronze", "products"))
        .select("product_id", "category", "in_stock", "region", "brand", "price"),
        "product_id")
@@ -87,16 +122,60 @@ embeddings = (products.repartition(max(1, n // 500))
  .write.mode("overwrite").option("overwriteSchema", "true")
  .saveAsTable(table(cfg, "silver", "product_embeddings")))
 
-print("done:", spark.table(table(cfg, "silver", "product_embeddings")).count())
+print("silver.product_embeddings:",
+      spark.table(table(cfg, "silver", "product_embeddings")).count())
 
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## Embed the eval queries, and label their slices
 # MAGIC
-# MAGIC `size_band` comes from how much of the frame the detected garment fills.
-# MAGIC Small items are the hard case — a bag occupying 3% of a photo has very few
-# MAGIC pixels to identify it by — and they are exactly what an aggregate metric
-# MAGIC hides.
+# MAGIC `size_band` comes from how much of the frame the detected garment fills. A
+# MAGIC bag covering 3% of a photo has very few pixels to identify it by, and that
+# MAGIC is exactly the case an aggregate metric hides.
+# MAGIC
+# MAGIC When the detector finds nothing we embed the whole image. Production does
+# MAGIC the same, so the eval set measures what a user would actually get rather
+# MAGIC than a flattering ideal.
+
+# COMMAND ----------
+queries = (spark.table(table(cfg, "gold", "eval_queries"))
+           .select("post_id", "query_image").toPandas())
+print(f"processing {len(queries)} eval queries")
+
+rows = []
+started = time.time()
+fell_back = 0
+
+for i, r in enumerate(queries.itertuples(), start=1):
+    try:
+        img = Image.open(r.query_image).convert("RGB")
+    except Exception:
+        continue
+
+    boxes = detector.predict(pd.DataFrame({"image": [b64_of(r.query_image)]}))
+
+    if len(boxes):
+        # Biggest confident thing wins — the item the photo is about, not a
+        # shoe in the corner.
+        boxes = boxes.assign(rank=boxes.area_frac * boxes.score)
+        best = boxes.loc[boxes["rank"].idxmax()]
+        area = float(best.area_frac)
+        crop = img.crop((float(best.x1), float(best.y1),
+                         float(best.x2), float(best.y2)))
+    else:
+        area, crop = 1.0, img
+        fell_back += 1
+
+    size_band = "small" if area < 0.08 else "medium" if area < 0.30 else "large"
+    occlusion = "heavy" if area < 0.05 else "none"
+
+    emb = embed_batch([b64_of_image(crop)])[0]
+    rows.append((r.post_id, emb.tolist(), size_band, occlusion))
+    progress(i, len(queries), started, "queries")
+
+print(f"processed {len(rows)} queries in {(time.time()-started)/60:.1f} min")
+print(f"detector found nothing on {fell_back} of them "
+      f"({fell_back/max(len(rows),1):.0%}) — those used the whole image")
 
 # COMMAND ----------
 Q_SCHEMA = T.StructType([
@@ -106,71 +185,10 @@ Q_SCHEMA = T.StructType([
     T.StructField("occlusion", T.StringType()),
 ])
 
-
-def make_query_processor(encoder_uri, detector_uri):
-    """
-    Detect the garment, crop it, embed the crop, and record the size slice.
-
-    Both models are pyfunc, so this function never touches transformers directly.
-    All the post-processing — threshold, box filtering, area fraction — lives
-    inside the detector artifact, so every caller behaves identically.
-    """
-    def process(iterator):
-        from PIL import Image
-
-        enc = mlflow.pyfunc.load_model(encoder_uri)
-        det = mlflow.pyfunc.load_model(detector_uri)
-
-        for pdf in iterator:
-            rows = []
-            for r in pdf.itertuples():
-                try:
-                    img = Image.open(r.query_image).convert("RGB")
-                except Exception:
-                    continue
-
-                with open(r.query_image, "rb") as fh:
-                    b64 = base64.b64encode(fh.read()).decode()
-                boxes = det.predict(pd.DataFrame({"image": [b64]}))
-
-                if len(boxes):
-                    # Biggest confident thing wins — the item the photo is about,
-                    # not a shoe in the corner.
-                    boxes = boxes.assign(rank=boxes.area_frac * boxes.score)
-                    best = boxes.loc[boxes["rank"].idxmax()]
-                    area = float(best.area_frac)
-                    crop = img.crop((float(best.x1), float(best.y1),
-                                     float(best.x2), float(best.y2)))
-                else:
-                    # No detection: fall back to the whole image. Production does
-                    # the same, so the eval set measures what users actually get.
-                    area, crop = 1.0, img
-
-                size_band = ("small" if area < 0.08
-                             else "medium" if area < 0.30 else "large")
-                occlusion = "heavy" if area < 0.05 else "none"
-
-                buf = io.BytesIO()
-                crop.save(buf, format="JPEG", quality=92)
-                emb = enc.predict(pd.DataFrame(
-                    {"image": [base64.b64encode(buf.getvalue()).decode()]}))
-                rows.append((r.post_id,
-                             np.asarray(emb, dtype=np.float32)[0].tolist(),
-                             size_band, occlusion))
-            yield pd.DataFrame(rows, columns=[f.name for f in Q_SCHEMA.fields])
-    return process
-
-
-DETECTOR = registry.resolve(cfg, cfg.registry.detector_model, CHAMPION)
-
-queries = spark.table(table(cfg, "gold", "eval_queries")).select("post_id", "query_image")
-q_out = (queries.repartition(8)
-         .mapInPandas(make_query_processor(ENCODER, DETECTOR), schema=Q_SCHEMA))
-
-(q_out.write.mode("overwrite").option("overwriteSchema", "true")
+(spark.createDataFrame(rows, schema=Q_SCHEMA)
+ .write.mode("overwrite").option("overwriteSchema", "true")
  .saveAsTable(table(cfg, "silver", "query_embeddings")))
 
-# COMMAND ----------
 # Fold the derived slice labels back into the frozen eval set.
 spark.sql(f"""
     MERGE INTO {table(cfg, "gold", "eval_queries")} AS t
