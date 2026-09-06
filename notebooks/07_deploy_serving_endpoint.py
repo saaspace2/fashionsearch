@@ -24,6 +24,39 @@
 # MAGIC Dependencies come from the job's `environments:` block.
 
 # COMMAND ----------
+# MAGIC %md
+# MAGIC ### Where is this running?
+# MAGIC
+# MAGIC Inside the job, dependencies come from the `torch` environment in
+# MAGIC `resources/jobs_pipeline.yml` and there is nothing to install.
+# MAGIC
+# MAGIC Opened by hand in the workspace, that environment does not apply and
+# MAGIC loading the model fails with a bare `ModuleNotFoundError: No module named
+# MAGIC 'torch'`, which does not explain itself. Hence this check.
+
+# COMMAND ----------
+_missing = []
+for _mod in ("torch", "torchvision", "transformers"):
+    try:
+        __import__(_mod)
+    except ImportError:
+        _missing.append(_mod)
+
+if _missing:
+    raise SystemExit(
+        f"Missing: {', '.join(_missing)}.\n\n"
+        f"You are running this notebook interactively, so the job's 'torch' "
+        f"environment does not apply.\n\n"
+        f"Either run it through the job:\n"
+        f"    databricks bundle run fashion_pipeline -t dev\n"
+        f"or re-run the 07_serving_check task from the Databricks Jobs UI.\n\n"
+        f"To keep working here instead, add this as the first cell and re-run:\n"
+        f"    %pip install -q torch torchvision transformers timm\n"
+        f"    %restart_python")
+
+print("dependencies present")
+
+# COMMAND ----------
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 from fashionsearch.config import load_config, table
