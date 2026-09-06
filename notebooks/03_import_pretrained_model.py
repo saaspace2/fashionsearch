@@ -77,12 +77,22 @@ print(f"loaded {CKPT}")
 # MAGIC %md
 # MAGIC ## Wrap for MLflow
 # MAGIC
-# MAGIC A `pyfunc` wrapper means the serving endpoint takes image bytes and
-# MAGIC returns embeddings, rather than exposing raw tensors. Anything that has to
-# MAGIC happen identically at training and serving time — here, the resize and
-# MAGIC normalisation — belongs inside the wrapper, not in the caller. Otherwise
-# MAGIC two callers preprocess slightly differently and the embeddings stop being
-# MAGIC comparable, which is very hard to debug from the outside.
+# MAGIC Two things matter here, and the second one cost a pipeline run.
+# MAGIC
+# MAGIC **Preprocessing lives inside the wrapper.** Resize and normalisation must
+# MAGIC happen identically at every call site, or two callers produce embeddings
+# MAGIC that are not comparable — very hard to diagnose from outside.
+# MAGIC
+# MAGIC **Save weights, not the object.** `torch.save(model, path)` uses plain
+# MAGIC pickle, which records the class *by reference* as `__main__.ImageEncoder`.
+# MAGIC Load it in another session and you get
+# MAGIC
+# MAGIC     AttributeError: Can't get attribute 'ImageEncoder' on <module '__main__'>
+# MAGIC
+# MAGIC because that name only existed in the notebook that saved it. So we save a
+# MAGIC `state_dict` plus the Swin config and the processor config, and rebuild the
+# MAGIC architecture inside `load_context` where the class definition is local.
+# MAGIC Everything needed is in the artifact directory — no network at load time.
 
 # COMMAND ----------
 import base64, io
@@ -93,17 +103,51 @@ import pandas as pd
 class EncoderWrapper(mlflow.pyfunc.PythonModel):
 
     def load_context(self, context):
-        import torch, torchvision.transforms as T
+        import os
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torchvision.transforms as T
         from PIL import Image
+        from transformers import AutoImageProcessor, SwinConfig, SwinModel
+
         self.torch = torch
         self.Image = Image
-        self.model = torch.load(context.artifacts["model"], weights_only=False)
-        self.model.eval()
-        size = encoder_config.image_size
+        d = context.artifacts["model"]
+
+        # Defined here, not at module scope, so unpickling never has to find it.
+        class ImageEncoder(nn.Module):
+            def __init__(self, swin_config, embedding_dim):
+                super().__init__()
+                self.swin = SwinModel(config=swin_config)
+                self.embedding_layer = nn.Linear(swin_config.hidden_size, embedding_dim)
+
+            def forward(self, pixel_values):
+                feats = self.swin(pixel_values).pooler_output
+                emb = self.embedding_layer(feats)
+                # L2 normalise so cosine similarity is a plain dot product,
+                # which is what the retrieval step computes.
+                return F.normalize(emb, p=2, dim=1)
+
+        swin_config = SwinConfig.from_pretrained(d)
+        processor = AutoImageProcessor.from_pretrained(d)
+        state = torch.load(os.path.join(d, "state_dict.pt"), map_location="cpu")
+
+        # Read the embedding size off the weights rather than passing it
+        # separately — one fewer thing that can disagree with the checkpoint.
+        embedding_dim = state["embedding_layer.weight"].shape[0]
+
+        model = ImageEncoder(swin_config, embedding_dim)
+        model.load_state_dict(state)
+        model.eval()
+        self.model = model
+        self.embedding_dim = embedding_dim
+
+        size = swin_config.image_size
         self.tf = T.Compose([
             T.Resize((size, size)),
             T.ToTensor(),
-            T.Normalize(mean=image_processor.image_mean, std=image_processor.image_std),
+            T.Normalize(mean=processor.image_mean, std=processor.image_std),
         ])
 
     def predict(self, context, model_input, params=None):
@@ -118,20 +162,24 @@ class EncoderWrapper(mlflow.pyfunc.PythonModel):
         return pd.DataFrame(emb)
 
 # COMMAND ----------
-import tempfile, os
+import os
+import tempfile
+from PIL import Image
 from mlflow.models import infer_signature
 
-tmp = tempfile.mkdtemp()
-model_path = os.path.join(tmp, "encoder.pt")
-torch.save(encoder, model_path)
+# A self-contained artifact directory: architecture config, preprocessing
+# config, and weights. No reference to any class in this notebook.
+enc_dir = tempfile.mkdtemp()
+encoder_config.save_pretrained(enc_dir)          # config.json
+image_processor.save_pretrained(enc_dir)         # preprocessor_config.json
+torch.save(encoder.state_dict(), os.path.join(enc_dir, "state_dict.pt"))
+print("encoder artifacts:", sorted(os.listdir(enc_dir)))
 
-# A tiny real image as the input example, so the logged signature is honest.
-from PIL import Image
 buf = io.BytesIO()
 Image.new("RGB", (224, 224), (128, 128, 128)).save(buf, format="JPEG")
 example = pd.DataFrame({"image": [base64.b64encode(buf.getvalue()).decode()]})
-output_example = pd.DataFrame(np.zeros((1, cfg.pretrained.encoder.embedding_dim),
-                                       dtype=np.float32))
+output_example = pd.DataFrame(
+    np.zeros((1, cfg.pretrained.encoder.embedding_dim), dtype=np.float32))
 
 with mlflow.start_run(run_name="import-encoder") as run:
     mlflow.log_params({
@@ -139,16 +187,34 @@ with mlflow.start_run(run_name="import-encoder") as run:
         "embedding_dim": cfg.pretrained.encoder.embedding_dim,
         "image_size": encoder_config.image_size,
         "trained_by": "yainage90 (imported, not trained here)",
+        "serialisation": "state_dict (not a pickled module)",
     })
     encoder_uri = log_model(
         mlflow.pyfunc, "encoder",
         python_model=EncoderWrapper(),
-        artifacts={"model": model_path},
+        artifacts={"model": enc_dir},
         signature=infer_signature(example, output_example),
         input_example=example,
         pip_requirements=["torch", "torchvision", "transformers", "pillow"],
     )
     print("logged", encoder_uri)
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ### Verify it round-trips before moving on
+# MAGIC
+# MAGIC Loading in a fresh process is the only way to catch a serialisation bug
+# MAGIC like the one above. Doing it here costs seconds; discovering it in
+# MAGIC notebook 05 costs a whole pipeline run.
+
+# COMMAND ----------
+reloaded = mlflow.pyfunc.load_model(encoder_uri)
+check = reloaded.predict(example)
+assert check.shape[1] == cfg.pretrained.encoder.embedding_dim, (
+    f"expected {cfg.pretrained.encoder.embedding_dim} dimensions, got {check.shape[1]}")
+norm = float(np.linalg.norm(np.asarray(check, dtype=np.float32)[0]))
+assert abs(norm - 1.0) < 1e-3, f"embeddings should be unit length, got {norm:.4f}"
+print(f"round-trip OK: {check.shape[1]} dims, norm {norm:.4f}")
 
 # COMMAND ----------
 # MAGIC %md
