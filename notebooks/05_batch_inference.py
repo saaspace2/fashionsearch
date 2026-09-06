@@ -98,17 +98,19 @@ Q_SCHEMA = T.StructType([
 ])
 
 
-def make_query_processor(encoder_uri, detector_name, alias):
+def make_query_processor(encoder_uri, detector_uri):
+    """
+    Detect the garment, crop it, embed the crop, and record the size slice.
+
+    Both models are pyfunc, so this function never touches transformers directly.
+    All the post-processing — threshold, box filtering, area fraction — lives
+    inside the detector artifact, so every caller behaves identically.
+    """
     def process(iterator):
-        import torch
         from PIL import Image
-        from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
         enc = mlflow.pyfunc.load_model(encoder_uri)
-        det_uri = f"models:/{detector_name}@{alias}"
-        det = mlflow.transformers.load_model(det_uri, return_type="components")
-        model, processor = det["model"], det["image_processor"]
-        model.eval()
+        det = mlflow.pyfunc.load_model(detector_uri)
 
         for pdf in iterator:
             rows = []
@@ -117,23 +119,22 @@ def make_query_processor(encoder_uri, detector_name, alias):
                     img = Image.open(r.query_image).convert("RGB")
                 except Exception:
                     continue
-                W, H = img.size
 
-                inputs = processor(images=[img], return_tensors="pt")
-                with torch.no_grad():
-                    out = model(**inputs)
-                res = processor.post_process_object_detection(
-                    out, threshold=0.35, target_sizes=torch.tensor([[H, W]]))[0]
+                with open(r.query_image, "rb") as fh:
+                    b64 = base64.b64encode(fh.read()).decode()
+                boxes = det.predict(pd.DataFrame({"image": [b64]}))
 
-                if len(res["boxes"]):
-                    best = int(res["scores"].argmax())
-                    x1, y1, x2, y2 = [float(v) for v in res["boxes"][best]]
-                    area = ((x2 - x1) * (y2 - y1)) / (W * H)
-                    crop = img.crop((x1, y1, x2, y2))
+                if len(boxes):
+                    # Biggest confident thing wins — the item the photo is about,
+                    # not a shoe in the corner.
+                    boxes = boxes.assign(rank=boxes.area_frac * boxes.score)
+                    best = boxes.loc[boxes["rank"].idxmax()]
+                    area = float(best.area_frac)
+                    crop = img.crop((float(best.x1), float(best.y1),
+                                     float(best.x2), float(best.y2)))
                 else:
-                    # No detection: fall back to the whole image. This is the
-                    # same fallback the serving path uses, so the eval set
-                    # measures what production actually does.
+                    # No detection: fall back to the whole image. Production does
+                    # the same, so the eval set measures what users actually get.
                     area, crop = 1.0, img
 
                 size_band = ("small" if area < 0.08
@@ -151,11 +152,11 @@ def make_query_processor(encoder_uri, detector_name, alias):
     return process
 
 
+DETECTOR = f"models:/{cfg.registry.detector_model}@{cfg.registry.aliases.champion}"
+
 queries = spark.table(table(cfg, "gold", "eval_queries")).select("post_id", "query_image")
 q_out = (queries.repartition(8)
-         .mapInPandas(make_query_processor(ENCODER, cfg.registry.detector_model,
-                                           cfg.registry.aliases.champion),
-                      schema=Q_SCHEMA))
+         .mapInPandas(make_query_processor(ENCODER, DETECTOR), schema=Q_SCHEMA))
 
 (q_out.write.mode("overwrite").option("overwriteSchema", "true")
  .saveAsTable(table(cfg, "silver", "query_embeddings")))

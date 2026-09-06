@@ -91,39 +91,36 @@ print(f"showing {len(q_pdf)} queries")
 # MAGIC user would get.
 
 # COMMAND ----------
-import mlflow, torch
+import mlflow
 from PIL import Image
-from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
 mlflow.set_registry_uri("databricks-uc")
 ALIAS = cfg.registry.aliases.champion
 
+# Both models are pyfunc: image bytes in, a DataFrame out. No transformers here.
 encoder = mlflow.pyfunc.load_model(f"models:/{cfg.registry.encoder_model}@{ALIAS}")
-det = mlflow.transformers.load_model(
-    f"models:/{cfg.registry.detector_model}@{ALIAS}", return_type="components")
-det_model, det_proc = det["model"], det["image_processor"]
-det_model.eval()
+detector = mlflow.pyfunc.load_model(f"models:/{cfg.registry.detector_model}@{ALIAS}")
+
+
+def detect(image_path):
+    with open(image_path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode()
+    return detector.predict(pd.DataFrame({"image": [b64]}))
 
 
 def search(image_path, category, top_k=8):
     """One full search. Returns (ranked ids, scores, the crop, whether we fell back)."""
     img = Image.open(image_path).convert("RGB")
-    W, H = img.size
-
-    inputs = det_proc(images=[img], return_tensors="pt")
-    with torch.no_grad():
-        out = det_model(**inputs)
-    res = det_proc.post_process_object_detection(
-        out, threshold=0.35, target_sizes=torch.tensor([[H, W]]))[0]
+    boxes = detect(image_path)
 
     fell_back = True
     crop = img
-    if len(res["boxes"]):
+    if len(boxes):
         # Same rule the serving path uses: biggest confident thing wins.
-        areas = [((b[2] - b[0]) * (b[3] - b[1])).item() / (W * H) for b in res["boxes"]]
-        best = int(np.argmax([a * s.item() for a, s in zip(areas, res["scores"])]))
-        x1, y1, x2, y2 = [float(v) for v in res["boxes"][best]]
-        crop = img.crop((x1, y1, x2, y2))
+        boxes = boxes.assign(rank=boxes.area_frac * boxes.score)
+        best = boxes.loc[boxes["rank"].idxmax()]
+        crop = img.crop((float(best.x1), float(best.y1),
+                         float(best.x2), float(best.y2)))
         fell_back = False
 
     buf = io.BytesIO()
@@ -260,22 +257,13 @@ dbutils.widgets.text("my_image", "", "Path to your own image")
 MY = dbutils.widgets.get("my_image").strip()
 
 if MY:
-    from PIL import Image as _I
-    img = _I.open(MY).convert("RGB")
-    inputs = det_proc(images=[img], return_tensors="pt")
-    with torch.no_grad():
-        out = det_model(**inputs)
-    res = det_proc.post_process_object_detection(
-        out, threshold=0.35,
-        target_sizes=torch.tensor([[img.size[1], img.size[0]]]))[0]
-
+    boxes = detect(MY)
     print("Detected:")
-    for s, l in zip(res["scores"], res["labels"]):
-        print(f"  {det_model.config.id2label[int(l)]:>8}  {float(s):.2f}")
+    for r in boxes.itertuples():
+        print(f"  {r.label:>8}  {r.score:.2f}  (covers {r.area_frac:.1%} of the photo)")
 
     blocks = []
-    for label_id in set(int(l) for l in res["labels"]):
-        cname = det_model.config.id2label[label_id]
+    for cname in boxes.label.unique():
         ranked, scores, crop, _ = search(MY, cname, TOP_K)
         if not ranked:
             continue
