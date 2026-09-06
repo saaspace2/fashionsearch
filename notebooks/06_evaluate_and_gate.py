@@ -12,7 +12,7 @@
 # COMMAND ----------
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
-from fashionsearch.config import load_config, table
+from fashionsearch.config import load_config, table, ensure_experiment
 from fashionsearch.metrics import evaluate_query
 from fashionsearch.promotion import evaluate_gate
 
@@ -25,6 +25,7 @@ from mlflow.tracking import MlflowClient
 from pyspark.sql import functions as F
 
 mlflow.set_registry_uri("databricks-uc")
+ensure_experiment(f"/Shared/{cfg.project.name}/evaluation")
 client = MlflowClient()
 K_VALUES = list(cfg.gate.k_values)
 

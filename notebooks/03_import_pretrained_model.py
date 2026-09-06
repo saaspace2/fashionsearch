@@ -22,13 +22,13 @@
 # COMMAND ----------
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
-from fashionsearch.config import load_config
+from fashionsearch.config import load_config, ensure_experiment
 
 cfg = load_config()
 
 import mlflow
 mlflow.set_registry_uri("databricks-uc")
-mlflow.set_experiment(f"/Shared/{cfg.project.name}/import")
+ensure_experiment(f"/Shared/{cfg.project.name}/import")
 
 # COMMAND ----------
 # MAGIC %md ## The encoder

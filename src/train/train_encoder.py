@@ -128,7 +128,10 @@ def train_fn(cfg: dict):
 def main():
     args = parse_args()
     mlflow.set_registry_uri("databricks-uc")
-    mlflow.set_experiment(f"/Shared/fashionsearch/{args.catalog}/encoder")
+    # MLflow does not create the folders above an experiment; see
+    # fashionsearch.config.ensure_experiment for why this matters.
+    from fashionsearch.config import ensure_experiment
+    ensure_experiment(f"/Shared/fashionsearch/{args.catalog}/encoder")
 
     from delta.tables import DeltaTable
     from pyspark.sql import SparkSession
