@@ -16,8 +16,14 @@
 # MAGIC | `yainage90/fashion-image-feature-extractor` | crop → 128-number embedding |
 
 # COMMAND ----------
-# MAGIC %pip install -q transformers torch torchvision huggingface_hub timm
-# MAGIC %restart_python
+# MAGIC %md
+# MAGIC Dependencies come from the job's `environments:` block in
+# MAGIC `resources/jobs_pipeline.yml`. Deliberately no `%pip install` here:
+# MAGIC installing again inside the notebook makes serverless build and cache a
+# MAGIC per-session environment archive, and a missing archive fails the run with
+# MAGIC `ENVIRONMENT_DOWNLOAD_USER_ERROR.NOT_FOUND`.
+# MAGIC
+# MAGIC To run this notebook interactively instead, install them by hand first.
 
 # COMMAND ----------
 import sys, pathlib

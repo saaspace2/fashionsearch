@@ -20,11 +20,19 @@ resources:
 
       tasks:
         - task_key: "00_unity_catalog_setup"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           environment_key: cpu
           notebook_task:
             notebook_path: ../notebooks/00_unity_catalog_setup.py
 
         - task_key: "01_ingest_data"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "00_unity_catalog_setup" }]
           environment_key: hf
           notebook_task:
@@ -33,24 +41,40 @@ resources:
               sample_size: "{{job.parameters.sample_size}}"
 
         - task_key: "02_prepare_eval_set"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "01_ingest_data" }]
           environment_key: cpu
           notebook_task:
             notebook_path: ../notebooks/02_prepare_eval_set.py
 
         - task_key: "03_import_pretrained_model"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "02_prepare_eval_set" }]
           environment_key: torch
           notebook_task:
             notebook_path: ../notebooks/03_import_pretrained_model.py
 
         - task_key: "04_register_model"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "03_import_pretrained_model" }]
           environment_key: cpu
           notebook_task:
             notebook_path: ../notebooks/04_register_model.py
 
         - task_key: "05_batch_inference"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "04_register_model" }]
           environment_key: torch
           notebook_task:
@@ -58,6 +82,10 @@ resources:
 
         # The gate. Everything upstream just produces a candidate for this.
         - task_key: "06_evaluate_and_gate"
+          # Serverless environment fetches occasionally 404. Retry rather
+          # than failing the whole run on a transient platform error.
+          max_retries: 2
+          min_retry_interval_millis: 60000
           depends_on: [{ task_key: "05_batch_inference" }]
           environment_key: torch
           notebook_task:
