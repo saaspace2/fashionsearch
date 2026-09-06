@@ -1,0 +1,62 @@
+digraph FashionFlow {
+  rankdir=TB; bgcolor="white"; nodesep=0.35; ranksep=0.42;
+  node [shape=box style="filled,rounded" fontname="Helvetica" fontsize=15
+        penwidth=1.4 margin="0.28,0.18"];
+  edge [fontname="Helvetica" fontsize=12 color="#7A8590" penwidth=1.5];
+
+  dev [label=<<FONT POINT-SIZE="16">Developer (VS Code)</FONT><BR/><FONT POINT-SIZE="12" COLOR="#6B7680">git push to main</FONT>>
+       fillcolor="#FAFAF8" color="#B4B2A9"];
+
+  subgraph cluster_gh {
+    label=<  <FONT POINT-SIZE="16">GitHub Actions</FONT><BR ALIGN="LEFT"/><FONT POINT-SIZE="12" COLOR="#6B7680">  Automatic on every push — 43 tests must pass before anything deploys</FONT><BR ALIGN="LEFT"/>  >;
+    labeljust="l"; style="rounded,dashed"; color="#B4B2A9"; fontname="Helvetica";
+    g1 [label=<<FONT POINT-SIZE="16">1 — Test and validate</FONT><BR/><FONT POINT-SIZE="12" COLOR="#2C5578">pytest, ruff, bundle validate</FONT>>
+        fillcolor="#DCE9F5" color="#7FA8CC" fontcolor="#1B3A57"];
+    g2 [label=<<FONT POINT-SIZE="16">2 — Deploy and set up</FONT><BR/><FONT POINT-SIZE="12" COLOR="#2C5578">bundle deploy, run fashion_setup</FONT>>
+        fillcolor="#DCE9F5" color="#7FA8CC" fontcolor="#1B3A57"];
+    g1 -> g2 [color="#7FA8CC"];
+  }
+
+  subgraph cluster_hf {
+    label=<  <FONT POINT-SIZE="16">Hugging Face — the only thing outside your workspace</FONT><BR ALIGN="LEFT"/><FONT POINT-SIZE="12" COLOR="#6B7680">  Downloaded at run time, never stored in the repo</FONT><BR ALIGN="LEFT"/>  >;
+    labeljust="l"; style="rounded,dashed"; color="#B4B2A9"; fontname="Helvetica";
+    h1 [label=<<FONT POINT-SIZE="15">Dataset — onthelook anchor-positive pairs</FONT><BR/><FONT POINT-SIZE="12" COLOR="#7A5A1E">2,000 sampled from ~290,000</FONT>>
+        fillcolor="#FAEEDA" color="#D9A85C" fontcolor="#6B4A21"];
+    h2 [label=<<FONT POINT-SIZE="15">Detector — fashion-object-detection</FONT><BR/><FONT POINT-SIZE="12" COLOR="#7A5A1E">conditional DETR, 7 garment classes</FONT>>
+        fillcolor="#FAEEDA" color="#D9A85C" fontcolor="#6B4A21"];
+    h3 [label=<<FONT POINT-SIZE="15">Encoder — fashion-image-feature-extractor</FONT><BR/><FONT POINT-SIZE="12" COLOR="#7A5A1E">Swin base + 128-d head, 348 MB</FONT>>
+        fillcolor="#FAEEDA" color="#D9A85C" fontcolor="#6B4A21"];
+    h1 -> h2 -> h3 [style=invis];
+  }
+
+  subgraph cluster_db {
+    label=<  <FONT POINT-SIZE="16">Databricks — serverless, CPU only</FONT><BR ALIGN="LEFT"/><FONT POINT-SIZE="12" COLOR="#6B7680">  No GPU anywhere: both models arrive already trained</FONT><BR ALIGN="LEFT"/>  >;
+    labeljust="l"; style="rounded,dashed"; color="#B4B2A9"; fontname="Helvetica";
+    n1 [label=<<FONT POINT-SIZE="15">01 — ingest data</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">images to Volumes, rows to Delta</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n2 [label=<<FONT POINT-SIZE="15">02 — freeze the eval set</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">split by product, assert no leakage</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n3 [label=<<FONT POINT-SIZE="15">03 — import both models</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">wrapped as MLflow pyfunc</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n4 [label=<<FONT POINT-SIZE="15">04 — register in Unity Catalog</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">versioned, no alias set yet</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n5 [label=<<FONT POINT-SIZE="15">05 — batch inference</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">every product and query to 128 numbers</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n6 [label=<<FONT POINT-SIZE="15">06 — evaluate and gate</FONT><BR/><FONT POINT-SIZE="12" COLOR="#8A5612">Recall@k, MRR, NDCG per slice — five checks</FONT>>
+        fillcolor="#FAEEDA" color="#BA7517" fontcolor="#6B4A21"];
+    n7 [label=<<FONT POINT-SIZE="15">07 — serving endpoint</FONT><BR/><FONT POINT-SIZE="12" COLOR="#1D6B4F">candidate enters at 0% traffic</FONT>>
+        fillcolor="#DDF0E6" color="#7FBFA0" fontcolor="#14563C"];
+    n1 -> n2 -> n3 -> n4 -> n5 -> n6 -> n7;
+  }
+
+  drift [label=<<FONT POINT-SIZE="16">08 — daily monitor</FONT><BR/><FONT POINT-SIZE="12" COLOR="#8B2C2C">click-through, zero-result and reformulation rates,<BR/>index staleness — per category, never only on average</FONT>>
+         fillcolor="#FBE4E4" color="#D98080" fontcolor="#7A1F1F"];
+
+  dev -> g1;
+  g2 -> n1 [label="  deploys the code, then runs setup  "];
+  h1 -> n1 [style=dashed color="#BA7517" constraint=false];
+  h3 -> n3 [style=dashed color="#BA7517" constraint=false];
+  n7 -> drift;
+  drift -> n5 [label="  clicks become positives · skipped results become hard negatives  "
+               style=dashed color="#BA7517" fontcolor="#8A5612" constraint=false];
+}

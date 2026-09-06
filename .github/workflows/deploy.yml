@@ -1,0 +1,120 @@
+name: deploy-to-databricks
+
+# What happens when:
+#
+#   pull request  -> tests + validate only. Never touches Databricks.
+#   push to main  -> tests, validate, deploy, run setup, THEN run the full
+#                    pipeline (notebooks 00 to 06). End to end, no clicks.
+#   tag v*        -> deploy to prod (manual approval).
+#
+# The full pipeline takes 20-40 minutes: it downloads a 348 MB model and embeds
+# a few thousand images. The runner waits for it, so the Actions log tells you
+# whether it actually worked rather than just whether it started.
+#
+# ESCAPE HATCH: put [skip pipeline] anywhere in the commit message and the
+# pipeline step is skipped. Use it for README edits and typo fixes — otherwise
+# a one-character change costs you half an hour of runner time.
+#
+#   git commit -m "fix typo in README [skip pipeline]"
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_full_pipeline:
+        description: 'Run the full pipeline (uncheck to only deploy)'
+        type: boolean
+        default: true
+      sample_size:
+        description: 'How many image pairs to ingest'
+        default: '2000'
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  validate:
+    name: Test and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test tools
+        run: pip install pytest pyyaml ruff
+
+      - name: Lint
+        # --exit-zero so style opinions never block a deploy. Real errors are
+        # caught by the tests below, which do block.
+        run: ruff check src/ --exit-zero
+
+      - name: Run tests
+        # Catches broken YAML, unparseable Python, job tasks pointing at files
+        # that do not exist, committed tokens, and gate-logic regressions.
+        run: pytest tests/ -v
+
+      - uses: databricks/setup-cli@main
+
+      - name: Validate the bundle
+        run: databricks bundle validate -t dev
+
+  deploy-and-run:
+    name: Deploy and run the pipeline
+    needs: validate
+    if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90        # the pipeline alone can take 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy
+        # Uploads the code and updates job definitions. Nothing executes yet.
+        run: databricks bundle deploy -t dev
+
+      - name: Show what was deployed
+        run: databricks bundle summary -t dev
+
+      - name: Create catalog, schemas and volumes
+        # Safe on every push: every statement is IF NOT EXISTS.
+        run: databricks bundle run fashion_setup -t dev
+
+      - name: Run the full pipeline
+        # Runs by default now. Skipped only when you ask: uncheck the box on a
+        # manual run, or put [skip pipeline] in the commit message.
+        if: >-
+          !contains(github.event.head_commit.message, '[skip pipeline]')
+          && (github.event_name != 'workflow_dispatch' || inputs.run_full_pipeline)
+        run: |
+          databricks bundle run fashion_pipeline -t dev \
+            --params sample_size=${{ inputs.sample_size || '2000' }}
+
+      - name: Where to look next
+        if: always()
+        run: |
+          echo "Catalog -> fashion_dev for the tables and image volumes."
+          echo "gold.retrieval_metrics holds Recall@k / MRR / NDCG per slice."
+          echo "Run notebooks/09_try_a_search.py in the workspace to see real results."
+
+  deploy-prod:
+    name: Deploy to prod
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: production      # add a required reviewer under Settings -> Environments
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      # NOTE: the prod target grants permissions to groups named search-readers
+      # and search-engineers. Create them first or delete the permissions block
+      # from databricks.yml, or this step fails.
+      - run: databricks bundle deploy -t prod

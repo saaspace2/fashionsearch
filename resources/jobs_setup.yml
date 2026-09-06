@@ -1,0 +1,21 @@
+# RUN THIS FIRST. Everything else assumes these objects exist.
+# Uses serverless compute (no job_clusters block), so it works on Free Edition.
+
+resources:
+  jobs:
+    fashion_setup:
+      name: "[${bundle.target}] FashionSearch — one-time workspace setup"
+      description: Creates the catalog, schemas and volumes the project needs. Safe to re-run.
+      max_concurrent_runs: 1
+      tasks:
+        - task_key: create_objects
+          environment_key: cpu
+          spark_python_task:
+            python_file: ../src/setup/00_create_workspace_objects.py
+            parameters:
+              - --catalog=${var.catalog}
+
+      environments:
+        - environment_key: cpu
+          spec:
+            environment_version: ${var.serverless_env_version}

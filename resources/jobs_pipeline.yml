@@ -1,0 +1,108 @@
+# The end-to-end pipeline, notebooks 00 through 08 as one Lakeflow job.
+#
+# Steps 00-01 are one-time setup and rarely re-run. 03-06 is the loop that runs
+# whenever a model changes. 08 runs daily on its own schedule.
+
+resources:
+  jobs:
+    fashion_pipeline:
+      name: "[${bundle.target}] FashionSearch — full pipeline"
+      description: >
+        Setup, ingest real HF data, import the pretrained models, register,
+        batch inference, per-slice evaluation and promotion gate.
+
+      email_notifications:
+        on_failure: ["${var.alert_email}"]
+
+      parameters:
+        - name: sample_size
+          default: "2000"
+
+      tasks:
+        - task_key: "00_unity_catalog_setup"
+          environment_key: cpu
+          notebook_task:
+            notebook_path: ../notebooks/00_unity_catalog_setup.py
+
+        - task_key: "01_ingest_data"
+          depends_on: [{ task_key: "00_unity_catalog_setup" }]
+          environment_key: hf
+          notebook_task:
+            notebook_path: ../notebooks/01_ingest_data.py
+            base_parameters:
+              sample_size: "{{job.parameters.sample_size}}"
+
+        - task_key: "02_prepare_eval_set"
+          depends_on: [{ task_key: "01_ingest_data" }]
+          environment_key: cpu
+          notebook_task:
+            notebook_path: ../notebooks/02_prepare_eval_set.py
+
+        - task_key: "03_import_pretrained_model"
+          depends_on: [{ task_key: "02_prepare_eval_set" }]
+          environment_key: torch
+          notebook_task:
+            notebook_path: ../notebooks/03_import_pretrained_model.py
+
+        - task_key: "04_register_model"
+          depends_on: [{ task_key: "03_import_pretrained_model" }]
+          environment_key: cpu
+          notebook_task:
+            notebook_path: ../notebooks/04_register_model.py
+
+        - task_key: "05_batch_inference"
+          depends_on: [{ task_key: "04_register_model" }]
+          environment_key: torch
+          notebook_task:
+            notebook_path: ../notebooks/05_batch_inference.py
+
+        # The gate. Everything upstream just produces a candidate for this.
+        - task_key: "06_evaluate_and_gate"
+          depends_on: [{ task_key: "05_batch_inference" }]
+          environment_key: torch
+          notebook_task:
+            notebook_path: ../notebooks/06_evaluate_and_gate.py
+
+      environments:
+        - environment_key: cpu
+          spec:
+            environment_version: ${var.serverless_env_version}
+            dependencies:
+              - pyyaml
+        - environment_key: hf
+          spec:
+            environment_version: ${var.serverless_env_version}
+            dependencies:
+              - pyyaml
+              - datasets
+              - huggingface_hub
+              - pillow
+        - environment_key: torch
+          spec:
+            environment_version: ${var.serverless_env_version}
+            dependencies:
+              - pyyaml
+              - torch
+              - torchvision
+              - transformers
+              - pillow
+
+    fashion_daily_monitor:
+      name: "[${bundle.target}] FashionSearch — daily monitor & reassess"
+      schedule:
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: Asia/Seoul
+        pause_status: PAUSED
+      email_notifications:
+        on_failure: ["${var.alert_email}"]
+      tasks:
+        - task_key: "08_monitor_and_reassess"
+          environment_key: cpu
+          notebook_task:
+            notebook_path: ../notebooks/08_monitor_and_reassess.py
+      environments:
+        - environment_key: cpu
+          spec:
+            environment_version: ${var.serverless_env_version}
+            dependencies:
+              - pyyaml

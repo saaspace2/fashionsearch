@@ -1,0 +1,75 @@
+# Single source of truth for the whole pipeline.
+# Every notebook reads this; nothing hardcodes a name or a threshold.
+
+project:
+  name: fashionsearch
+  owner: search-team@example.com
+
+catalog:
+  name: fashion_dev
+  schemas: [raw, bronze, silver, gold, ml, monitoring]
+  volumes:
+    product_images: /Volumes/fashion_dev/raw/product_images
+    query_images:   /Volumes/fashion_dev/raw/query_images
+    artifacts:      /Volumes/fashion_dev/ml/artifacts
+
+# Pretrained models pulled from Hugging Face by notebook 03.
+# These are the original project author's published checkpoints — real,
+# public, and directly usable. No training required.
+pretrained:
+  detector:
+    hf_repo: yainage90/fashion-object-detection
+    task: object-detection
+    categories: [bag, bottom, dress, hat, outer, shoes, top]
+  encoder:
+    hf_repo: yainage90/fashion-image-feature-extractor
+    embedding_dim: 128          # the published encoder outputs 128, not 512
+    image_size: 224
+
+# Datasets pulled from Hugging Face by notebook 01.
+data:
+  detection:
+    hf_dataset: yainage90/fashion-object-detection
+    split: train
+  pairs:
+    hf_dataset: yainage90/onthelook-fashion-anchor-positive-images
+    split: train
+  # Keep this small for a first run. Free Edition has no GPU, so embedding
+  # 290k images on CPU would take days. 2000 is enough to get real numbers.
+  sample_size: 2000
+  eval_queries: 200
+
+registry:
+  detector_model: fashion_dev.ml.fashion_detector
+  encoder_model:  fashion_dev.ml.fashion_encoder
+  aliases:
+    candidate: candidate
+    shadow: shadow
+    champion: production
+
+# Promotion gate. A candidate must clear ALL of these to earn @candidate.
+# See src/fashionsearch/promotion.py.
+gate:
+  primary_metric: ndcg_at_20
+  k_values: [1, 5, 10, 20, 50]
+  min_ndcg20_vs_champion: 0.0      # must at least match
+  max_recall20_drop_any_slice: 0.01
+  max_recall20_drop_protected: 0.005
+  min_queries_per_slice: 25
+  protected_slices:
+    - [category, bag]
+    - [category, hat]
+    - [size_band, small]
+    - [occlusion, heavy]
+
+serving:
+  endpoint_name: fashion-encoder-endpoint
+  workload_size: Small
+  scale_to_zero: true
+  max_p95_latency_ms: 250
+
+monitoring:
+  min_ctr: 0.18
+  max_zero_result_rate: 0.04
+  max_index_staleness_hours: 6
+  drift_threshold: 0.15

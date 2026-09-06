@@ -1,0 +1,57 @@
+bundle:
+  name: fashionsearch
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog catalog holding all FashionSearch assets
+    default: fashion
+  detector_model:
+    default: fashion.ml.fashion_detector
+  encoder_model:
+    default: fashion.ml.fashion_encoder
+  vs_endpoint:
+    description: Databricks Vector Search endpoint name
+    default: fashion-vs-endpoint
+  vs_index:
+    default: fashion.ml.product_search_index
+  embedding_dim:
+    default: "512"
+  serverless_env_version:
+    description: >
+      Serverless environment version for CPU tasks. Version 1 is not supported;
+      use "2" or higher.
+    default: "2"
+  gpu_env_version:
+    default: "2"
+  alert_email:
+    default: search-team@example.com
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      # >>> REPLACE THIS with your own workspace URL <<<
+      host: https://dbc-34ada41e-0aa1.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      catalog: fashion_dev
+      detector_model: fashion_dev.ml.fashion_detector
+      encoder_model: fashion_dev.ml.fashion_encoder
+      vs_index: fashion_dev.ml.product_search_index
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-34ada41e-0aa1.cloud.databricks.com
+      root_path: /Workspace/fashionsearch/prod
+    variables:
+      catalog: fashion
+    permissions:
+      - level: CAN_VIEW
+        group_name: search-readers
+      - level: CAN_MANAGE_RUN
+        group_name: search-engineers
