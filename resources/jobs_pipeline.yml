@@ -91,6 +91,29 @@ resources:
           notebook_task:
             notebook_path: ../notebooks/06_evaluate_and_gate.py
 
+        # 07 and 08 use run_if: ALL_DONE so they run even when the gate blocks
+        # promotion. A blocked candidate is a normal outcome, and monitoring
+        # should not go dark because of it — that is exactly when you want it.
+        - task_key: "07_serving_check"
+          depends_on: [{ task_key: "06_evaluate_and_gate" }]
+          run_if: ALL_DONE
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          environment_key: torch
+          notebook_task:
+            notebook_path: ../notebooks/07_deploy_serving_endpoint.py
+            base_parameters:
+              alias: production
+
+        - task_key: "08_monitor_and_reassess"
+          depends_on: [{ task_key: "07_serving_check" }]
+          run_if: ALL_DONE
+          max_retries: 2
+          min_retry_interval_millis: 60000
+          environment_key: cpu
+          notebook_task:
+            notebook_path: ../notebooks/08_monitor_and_reassess.py
+
       environments:
         - environment_key: cpu
           spec:

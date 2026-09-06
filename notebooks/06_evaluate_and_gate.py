@@ -119,6 +119,8 @@ encoder_version = registry.latest_version(cfg, cfg.registry.encoder_model)
 champ_rows = []
 try:
     champ_version = registry.latest_version(cfg, cfg.registry.encoder_model)
+    # retrieval_metrics is append-only, so repeated runs of the same version
+    # leave several sets of rows. Compare against the most recent one only.
     hist = spark.table(table(cfg, "gold", "retrieval_metrics")) \
         .filter(F.col("model_version") == str(champ_version))
     if hist.count():

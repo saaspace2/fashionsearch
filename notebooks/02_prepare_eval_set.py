@@ -100,3 +100,39 @@ display(spark.sql(f"""
     FROM {table(cfg, "gold", "eval_queries")}
     GROUP BY category ORDER BY eval_queries DESC
 """))
+
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Will the promotion gate be able to measure its protected slices?
+# MAGIC
+# MAGIC The gate blocks on `protected_slice_coverage` when a protected slice has
+# MAGIC too few queries to measure. Finding that out here costs seconds; finding
+# MAGIC out in notebook 06 costs the whole pipeline run.
+
+# COMMAND ----------
+min_q = int(cfg.gate.min_queries_per_slice)
+eval_df = spark.table(table(cfg, "gold", "eval_queries"))
+
+print(f"eval queries: {eval_df.count()}   gate floor: {min_q} per protected slice\n")
+
+problems = []
+for dim, value in [tuple(p) for p in cfg.gate.protected_slices]:
+    if dim not in eval_df.columns:
+        print(f"  {dim}={value:<10} column not present yet (set by notebook 05)")
+        continue
+    n = eval_df.filter(F.col(dim) == value).count()
+    ok = n >= min_q
+    print(f"  {dim}={value:<10} {n:>4} queries  [{'OK' if ok else 'TOO FEW'}]")
+    if not ok:
+        problems.append(f"{dim}={value} ({n})")
+
+if problems:
+    print(f"\nThese will block the gate: {', '.join(problems)}")
+    print("Options, in order of preference:")
+    print("  1. Raise data.sample_size in config.yaml — more data, more of everything")
+    print("  2. Lower gate.min_queries_per_slice — honest only if you accept that a")
+    print("     recall estimate from a handful of queries is noise")
+    print("  3. Edit gate.protected_slices to match what this dataset contains")
+    print("\nDo NOT simply delete the hard slices. They are protected because they")
+    print("are the categories an average would hide.")

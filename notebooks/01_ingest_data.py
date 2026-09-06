@@ -128,6 +128,27 @@ if category_col is None:
 # MAGIC around — pointers keep the tables small enough to scan freely.
 
 # COMMAND ----------
+# Hugging Face stores categories as ClassLabel integers. Writing str(0) gives
+# you a catalogue of categories called "0".."6", which looks fine until the gate
+# tries to score `category = 'bag'` and finds nothing. Resolve the names here.
+_cat_feature = features.get(category_col) if category_col else None
+_cat_names = getattr(_cat_feature, "names", None)
+
+if _cat_names:
+    print(f"category names from the dataset: {_cat_names}")
+else:
+    print("category column is not a ClassLabel; values will be used as-is")
+
+
+def category_of(item):
+    if not category_col:
+        return "unknown"
+    raw = item[category_col]
+    if _cat_names is not None and isinstance(raw, int):
+        return _cat_names[raw]
+    return str(raw)
+
+
 prod_dir = cfg.catalog.volumes.product_images
 query_dir = cfg.catalog.volumes.query_images
 os.makedirs(prod_dir, exist_ok=True)
@@ -158,7 +179,7 @@ for i, item in enumerate(pairs):
             print(f"  skipped row {i}: {e}")
         continue
 
-    category = str(item[category_col]) if category_col else "unknown"
+    category = category_of(item)
 
     product_rows.append((pid, pos_path, category, None, None, None, "KRW",
                          True, "KR", cfg.data.pairs.hf_dataset, True))
@@ -194,11 +215,18 @@ posts.write.mode("overwrite").option("overwriteSchema", "true") \
     .saveAsTable(table(cfg, "bronze", "posts"))
 
 # COMMAND ----------
-display(spark.sql(f"""
+cat_counts = spark.sql(f"""
     SELECT category, count(*) AS n
     FROM {table(cfg, "bronze", "products")}
     GROUP BY category ORDER BY n DESC
-"""))
+""")
+display(cat_counts)
+
+numeric = [r["category"] for r in cat_counts.collect() if r["category"].isdigit()]
+if numeric:
+    print(f"\nWARNING: categories look numeric ({numeric[:5]}). The promotion gate "
+          f"scores slices by name (bag, hat, ...), so those slices will never "
+          f"match and notebook 06 will block on protected_slice_coverage.")
 
 # COMMAND ----------
 # MAGIC %md

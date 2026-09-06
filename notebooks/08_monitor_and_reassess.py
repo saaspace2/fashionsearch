@@ -1,16 +1,24 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 08 — Monitor and reassess the champion
+# MAGIC # 08 — Monitor and reassess
 # MAGIC
-# MAGIC Two jobs in one notebook, run daily.
+# MAGIC Four checks, run daily. Three of them work from day one; only the fourth
+# MAGIC needs production traffic.
 # MAGIC
-# MAGIC **Monitor** — is production search still working? Click-through, zero-result
-# MAGIC rate, reformulation rate, index freshness, latency.
+# MAGIC | Check | Needs |
+# MAGIC |---|---|
+# MAGIC | Catalogue coverage | nothing — runs immediately |
+# MAGIC | Index freshness | nothing |
+# MAGIC | Champion trend | two or more evaluations |
+# MAGIC | Online search quality | real users |
 # MAGIC
-# MAGIC **Reassess** — re-run the frozen eval set against the current champion. A
-# MAGIC model file does not change, but the catalogue does: new products arrive, old
-# MAGIC ones sell out, and the champion's real Recall@20 drifts even though its
-# MAGIC weights are identical. Without this you would only find out from users.
+# MAGIC The last one is skipped with a note rather than treated as a failure. An
+# MAGIC empty `search_events` table on a system nobody uses yet is not an alert;
+# MAGIC reporting it as one would teach you to ignore this notebook.
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC Dependencies come from the job's `environments:` block.
 
 # COMMAND ----------
 import sys, pathlib
@@ -23,106 +31,141 @@ import json
 from pyspark.sql import functions as F
 
 alerts = []
+skipped = []
+
+
+def alert(kind, severity, value, hint, **extra):
+    alerts.append({"kind": kind, "severity": severity, "value": value,
+                   "hint": hint, **extra})
 
 # COMMAND ----------
-# MAGIC %md ## Online metrics
+# MAGIC %md
+# MAGIC ## 1 · Catalogue coverage
+# MAGIC
+# MAGIC Every product must have an embedding. A product in the catalogue but not
+# MAGIC in the index is invisible to search, and nothing else in the system will
+# MAGIC tell you — the searches that should have returned it simply do not.
 
 # COMMAND ----------
-m = spark.sql(f"""
-    SELECT
-      count(*)                                           AS n_searches,
-      avg(CASE WHEN size(clicked) > 0 THEN 1 ELSE 0 END) AS ctr,
-      avg(CASE WHEN n_results = 0   THEN 1 ELSE 0 END)   AS zero_result_rate,
-      avg(CASE WHEN reformulated   THEN 1 ELSE 0 END)    AS reformulation_rate,
-      percentile_approx(latency_ms, 0.95)                AS p95_latency
-    FROM {table(cfg, "bronze", "search_events")}
-    WHERE event_ts >= current_date() - INTERVAL 1 DAYS
+n_products = spark.table(table(cfg, "bronze", "products")).count()
+n_embedded = spark.table(table(cfg, "silver", "product_embeddings")).count()
+coverage = n_embedded / n_products if n_products else 0.0
+
+print(f"  products in catalogue : {n_products}")
+print(f"  products embedded     : {n_embedded}")
+print(f"  coverage              : {coverage:.1%}")
+
+if coverage < 0.99:
+    alert("incomplete_index", "high", round(coverage, 4),
+          f"{n_products - n_embedded} products are unsearchable. Re-run notebook 05.")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 2 · Index freshness
+# MAGIC
+# MAGIC A fashion catalogue turns over constantly. A stale index returns products
+# MAGIC that are sold out or delisted, which users experience simply as the search
+# MAGIC being broken.
+
+# COMMAND ----------
+fresh = spark.sql(f"""
+    SELECT max(embedded_at) AS last_embedded,
+           timestampdiff(HOUR, max(embedded_at), current_timestamp()) AS hours
+    FROM {table(cfg, "silver", "product_embeddings")}
 """).first()
 
-if m and m["n_searches"]:
-    if m["ctr"] < cfg.monitoring.min_ctr:
-        alerts.append({"kind": "low_ctr", "severity": "high", "value": float(m["ctr"]),
-                       "hint": "results stopped matching intent — check for a recent "
-                               "model or index change before anything else"})
-    if m["zero_result_rate"] > cfg.monitoring.max_zero_result_rate:
-        alerts.append({"kind": "zero_results", "severity": "high",
-                       "value": float(m["zero_result_rate"]),
-                       "hint": "filters too strict, or a category has no stock"})
-    if m["reformulation_rate"] > 0.30:
-        # The most honest quality signal available. A user searching again
-        # immediately is telling you the first attempt failed.
-        alerts.append({"kind": "high_reformulation", "severity": "warning",
-                       "value": float(m["reformulation_rate"]),
-                       "hint": "users are retrying — the first result set is wrong"})
+max_hours = float(cfg.monitoring.max_index_staleness_hours)
+if fresh and fresh["hours"] is not None:
+    print(f"  last embedded : {fresh['last_embedded']}")
+    print(f"  age           : {fresh['hours']} h  (limit {max_hours:.0f} h)")
+    if fresh["hours"] > max_hours:
+        alert("index_stale", "high", float(fresh["hours"]),
+              "search may be returning products that no longer exist")
 else:
-    print("no production traffic yet — online checks skipped")
+    alert("no_index", "high", 0.0, "no embeddings at all — run notebook 05")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Per-category click-through
+# MAGIC ## 3 · Champion trend
 # MAGIC
-# MAGIC The same reason the gate slices: a collapse in one category is invisible in
-# MAGIC the overall average and is usually the first sign of a real regression.
+# MAGIC The model file does not change, but the catalogue does. Re-scoring the
+# MAGIC frozen eval set catches drift that the weights alone would never reveal:
+# MAGIC new products arrive, old ones sell out, and real Recall@20 moves even
+# MAGIC though nothing was retrained.
 
 # COMMAND ----------
-per_cat = spark.sql(f"""
-    SELECT selected_category AS category,
-           avg(CASE WHEN size(clicked) > 0 THEN 1 ELSE 0 END) AS ctr,
-           count(*) AS n
-    FROM {table(cfg, "bronze", "search_events")}
-    WHERE event_ts >= current_date() - INTERVAL 7 DAYS
-    GROUP BY selected_category
-    HAVING count(*) > 200
-       AND avg(CASE WHEN size(clicked) > 0 THEN 1 ELSE 0 END) < {cfg.monitoring.min_ctr}
-""")
-for r in per_cat.collect():
-    alerts.append({"kind": "category_ctr_low", "severity": "warning",
-                   "category": r["category"], "value": float(r["ctr"]),
-                   "hint": "this category is failing while the average looks fine"})
+history = (spark.table(table(cfg, "gold", "retrieval_metrics"))
+           .filter(F.col("slice_dim") == "overall")
+           .select("model_version", "evaluated_at", "n_queries",
+                   "recall_at_20", "ndcg_at_20", "mrr", "gate_passed")
+           .orderBy(F.desc("evaluated_at")))
 
-# COMMAND ----------
-# MAGIC %md ## Index freshness
+n_evals = history.count()
+if n_evals:
+    display(history.limit(10))
 
-# COMMAND ----------
-try:
-    stale = spark.sql(f"""
-        SELECT timestampdiff(HOUR, max(embedded_at), current_timestamp()) AS hours
-        FROM {table(cfg, "silver", "product_embeddings")}
-    """).first()
-    if stale and stale["hours"] and stale["hours"] > cfg.monitoring.max_index_staleness_hours:
-        alerts.append({"kind": "index_stale", "severity": "high",
-                       "value": float(stale["hours"]),
-                       "hint": "search is returning products that may no longer exist"})
-except Exception as e:
-    print("freshness check skipped:", e)
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## Reassess the champion
-# MAGIC
-# MAGIC Compare today's per-slice numbers against the champion's numbers when it
-# MAGIC was promoted. A drop here with unchanged weights means the *catalogue*
-# MAGIC changed underneath the model.
-
-# COMMAND ----------
-history = spark.table(table(cfg, "gold", "retrieval_metrics")) \
-    .filter(F.col("slice_dim") == "overall")
-
-if history.count() >= 2:
-    trend = (history.orderBy(F.desc("evaluated_at"))
-             .select("model_version", "evaluated_at", "ndcg_at_20", "recall_at_20")
-             .limit(10).toPandas())
-    display(spark.createDataFrame(trend))
-
-    newest, previous = trend.iloc[0], trend.iloc[1]
-    delta = float(newest.ndcg_at_20) - float(previous.ndcg_at_20)
+if n_evals >= 2:
+    rows = history.limit(2).collect()
+    newest, previous = rows[0], rows[1]
+    delta = float(newest["ndcg_at_20"]) - float(previous["ndcg_at_20"])
+    print(f"  NDCG@20 change since last evaluation: {delta:+.4f}")
     if delta < -0.02:
-        alerts.append({"kind": "champion_degraded", "severity": "high",
-                       "value": delta,
-                       "hint": "NDCG@20 fell with no model change — the catalogue "
-                               "shifted. Consider re-embedding or retraining."})
+        alert("champion_degraded", "high", round(delta, 4),
+              "quality fell with no model change — the catalogue shifted under it")
+elif n_evals == 1:
+    only = history.first()
+    print(f"  one evaluation so far: NDCG@20 {only['ndcg_at_20']:.4f} "
+          f"over {only['n_queries']} queries")
+    skipped.append("champion trend — needs a second evaluation to compare against")
 else:
-    print("not enough evaluation history to trend yet")
+    skipped.append("champion trend — no evaluations yet, run notebook 06")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## 4 · Online search quality
+# MAGIC
+# MAGIC Offline metrics predict; online metrics decide. A model that gains two
+# MAGIC points of NDCG offline and loses click-through in an A/B test has not
+# MAGIC improved, whatever the eval set says.
+
+# COMMAND ----------
+n_events = spark.table(table(cfg, "bronze", "search_events")).count()
+
+if n_events == 0:
+    skipped.append("online metrics — no production traffic yet")
+    print("  no search events recorded. Nothing is wrong; nobody has searched.")
+    print("  Once an application writes to bronze.search_events, this section")
+    print("  starts reporting click-through, zero-result and reformulation rates.")
+else:
+    m = spark.sql(f"""
+        SELECT count(*)                                           AS n,
+               avg(CASE WHEN size(clicked) > 0 THEN 1 ELSE 0 END) AS ctr,
+               avg(CASE WHEN n_results = 0    THEN 1 ELSE 0 END)  AS zero_rate,
+               avg(CASE WHEN reformulated    THEN 1 ELSE 0 END)   AS reform_rate,
+               percentile_approx(latency_ms, 0.95)                AS p95
+        FROM {table(cfg, "bronze", "search_events")}
+        WHERE event_ts >= current_date() - INTERVAL 1 DAYS
+    """).first()
+
+    if m and m["n"]:
+        print(f"  searches (24h)      : {m['n']}")
+        print(f"  click-through       : {m['ctr']:.1%}")
+        print(f"  zero-result rate    : {m['zero_rate']:.1%}")
+        print(f"  reformulation rate  : {m['reform_rate']:.1%}")
+        if m["ctr"] < float(cfg.monitoring.min_ctr):
+            alert("low_ctr", "high", float(m["ctr"]),
+                  "results stopped matching intent — check for a recent model change")
+        if m["zero_rate"] > float(cfg.monitoring.max_zero_result_rate):
+            alert("zero_results", "high", float(m["zero_rate"]),
+                  "filters too strict, or a category has no stock")
+        if m["reform_rate"] > 0.30:
+            # The most honest quality signal there is: a user searching again
+            # immediately is telling you the first attempt failed.
+            alert("high_reformulation", "warning", float(m["reform_rate"]),
+                  "users are retrying — the first result set is wrong")
+
+# COMMAND ----------
+# MAGIC %md ## Summary
 
 # COMMAND ----------
 spark.sql(f"""
@@ -131,14 +174,26 @@ spark.sql(f"""
 """)
 
 if alerts:
-    (spark.createDataFrame([(json.dumps(a), a["kind"], a["severity"]) for a in alerts],
-                           "payload STRING, kind STRING, severity STRING")
+    (spark.createDataFrame(
+        [(json.dumps(a), a["kind"], a["severity"]) for a in alerts],
+        "payload STRING, kind STRING, severity STRING")
      .withColumn("raised_at", F.current_timestamp())
      .write.mode("append").saveAsTable(table(cfg, "monitoring", "alerts")))
 
-print(f"{len(alerts)} alerts")
+print(f"\n{len(alerts)} alert(s), {len(skipped)} check(s) skipped\n")
 for a in alerts:
-    print(f"  [{a['severity']:>7}] {a['kind']}: {a.get('hint', '')}")
+    print(f"  [{a['severity']:>7}] {a['kind']}: {a['hint']}")
+for s in skipped:
+    print(f"  [ skipped] {s}")
 
-if any(a["severity"] == "high" for a in alerts):
-    raise Exception("High-severity alert — see monitoring.alerts")
+if not alerts and not skipped:
+    print("  everything healthy")
+
+# COMMAND ----------
+# A high-severity alert fails the job on purpose. A log line is something nobody
+# reads; a red job is something somebody notices. Warnings and skips do not fail.
+high = [a for a in alerts if a["severity"] == "high"]
+if high:
+    raise Exception(
+        f"{len(high)} high-severity alert(s): {', '.join(a['kind'] for a in high)}. "
+        f"See {table(cfg, 'monitoring', 'alerts')}.")

@@ -57,23 +57,73 @@ print(f"\nregistration mode: {enc['mode']}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Bootstrap the champion
+# MAGIC ## Champion selection
 # MAGIC
-# MAGIC With no champion there is nothing for the gate to compare against, so on a
-# MAGIC completely empty registry the first version becomes champion. Every version
-# MAGIC after that faces a real comparison.
+# MAGIC Normally the gate in notebook 06 decides promotion and this notebook leaves
+# MAGIC the champion alone. Two exceptions:
+# MAGIC
+# MAGIC 1. **No champion yet.** Nothing to compare against, so the first version
+# MAGIC    becomes champion and every version after it faces a real comparison.
+# MAGIC 2. **The champion cannot be loaded.** That is not a quality judgement, it is
+# MAGIC    a broken artifact — a bad serialisation, a deleted run, an expired
+# MAGIC    upload. Leaving it in place blocks the whole pipeline on a model nobody
+# MAGIC    can use, and no amount of evaluation will fix it.
+# MAGIC
+# MAGIC Case 2 is why this exists. An earlier version of notebook 03 saved the
+# MAGIC encoder with `torch.save(model, path)`, which pickles the class by
+# MAGIC reference. Every later notebook failed with
+# MAGIC `AttributeError: Can't get attribute 'ImageEncoder'`, and re-running 03 did
+# MAGIC not help because the alias still pointed at the broken version.
 
 # COMMAND ----------
+import mlflow
+
 CHAMPION = cfg.registry.aliases.champion
+
+
+def champion_status(name: str):
+    """Returns (state, detail). state is 'missing', 'broken' or 'ok'."""
+    try:
+        uri = registry.resolve(cfg, name, CHAMPION)
+    except SystemExit:
+        return "missing", "no champion alias set"
+
+    try:
+        mlflow.pyfunc.load_model(uri)
+        return "ok", uri
+    except Exception as exc:
+        return "broken", f"{uri} does not load: {type(exc).__name__}: {exc}"
+
 
 for name, result in [(cfg.registry.encoder_model, enc),
                      (cfg.registry.detector_model, det)]:
-    try:
-        existing = registry.resolve(cfg, name, CHAMPION)
-        print(f"{name}: champion already set ({existing}) — leaving it")
-    except SystemExit:
+    state, detail = champion_status(name)
+
+    if state == "ok":
+        print(f"{name}: champion loads fine ({detail}) — leaving it alone.")
+        print("  Promotion of the new version is the gate's decision, not this notebook's.")
+    elif state == "missing":
         registry.set_alias(cfg, name, CHAMPION, result["version"])
-        print(f"{name}: bootstrapped @{CHAMPION} = v{result['version']}")
+        print(f"{name}: no champion existed — bootstrapped @{CHAMPION} "
+              f"= v{result['version']}")
+    else:
+        print(f"{name}: EXISTING CHAMPION IS BROKEN")
+        print(f"  {detail}")
+        registry.set_alias(cfg, name, CHAMPION, result["version"])
+        registry.set_tag(cfg, name, result["version"], "promoted_reason",
+                         "previous champion could not be loaded")
+        print(f"  repointed @{CHAMPION} to v{result['version']} (this run's import)")
+
+# COMMAND ----------
+# MAGIC %md ## Verify what downstream notebooks will actually get
+
+# COMMAND ----------
+for name in [cfg.registry.encoder_model, cfg.registry.detector_model]:
+    uri = registry.resolve(cfg, name, CHAMPION)
+    mlflow.pyfunc.load_model(uri)
+    print(f"  {name} @{CHAMPION} loads: {uri}")
+
+print("\nBoth champions load. Notebook 05 will use exactly these.")
 
 # COMMAND ----------
 if enc["mode"] == "fallback":
