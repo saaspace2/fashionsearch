@@ -11,7 +11,7 @@
 # MAGIC takes a few minutes. Scale `sample_size` in `config.yaml` accordingly.
 
 # COMMAND ----------
-# MAGIC %pip install -q torch torchvision transformers pillow
+# MAGIC %pip install -q torch torchvision transformers pillow timm
 # MAGIC %restart_python
 
 # COMMAND ----------

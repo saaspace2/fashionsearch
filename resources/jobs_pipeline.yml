@@ -86,6 +86,10 @@ resources:
               - torchvision
               - transformers
               - pillow
+              # Conditional DETR builds its ResNet-50 backbone through
+              # TimmBackbone. Without timm, transformers raises ImportError and
+              # the detector cannot load at all.
+              - timm
 
     fashion_daily_monitor:
       name: "[${bundle.target}] FashionSearch — daily monitor & reassess"

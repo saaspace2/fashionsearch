@@ -19,7 +19,7 @@
 # MAGIC Nothing here writes to any table. It is safe to run repeatedly.
 
 # COMMAND ----------
-# MAGIC %pip install -q torch torchvision transformers pillow
+# MAGIC %pip install -q torch torchvision transformers pillow timm
 # MAGIC %restart_python
 
 # COMMAND ----------

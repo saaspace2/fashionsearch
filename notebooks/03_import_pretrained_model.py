@@ -16,7 +16,7 @@
 # MAGIC | `yainage90/fashion-image-feature-extractor` | crop → 128-number embedding |
 
 # COMMAND ----------
-# MAGIC %pip install -q transformers torch torchvision huggingface_hub
+# MAGIC %pip install -q transformers torch torchvision huggingface_hub timm
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -151,8 +151,20 @@ with mlflow.start_run(run_name="import-encoder") as run:
 from transformers import AutoModelForObjectDetection
 
 DET_CKPT = cfg.pretrained.detector.hf_repo
-detector = AutoModelForObjectDetection.from_pretrained(DET_CKPT).eval()
-det_processor = AutoImageProcessor.from_pretrained(DET_CKPT)
+
+# Load explicitly rather than letting a failure here surface later as a
+# confusing NameError on a variable that was never assigned.
+try:
+    detector = AutoModelForObjectDetection.from_pretrained(DET_CKPT).eval()
+    det_processor = AutoImageProcessor.from_pretrained(DET_CKPT)
+except ImportError as exc:
+    raise SystemExit(
+        f"Could not load {DET_CKPT}: {exc}\n\n"
+        f"This detector needs 'timm' — conditional DETR builds its ResNet-50 "
+        f"backbone through TimmBackbone. Add timm to the %pip line at the top of "
+        f"this notebook AND to the 'torch' environment in "
+        f"resources/jobs_pipeline.yml, then re-run.") from exc
+
 print("categories:", detector.config.id2label)
 
 with mlflow.start_run(run_name="import-detector") as run:
