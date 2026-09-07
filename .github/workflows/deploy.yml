@@ -46,7 +46,9 @@ jobs:
           python-version: '3.11'
 
       - name: Install test tools
-        run: pip install pytest pyyaml ruff
+        # Kept in a file rather than inline so it cannot drift out of step with
+        # what the tests actually import.
+        run: pip install -r requirements-ci.txt
 
       - name: Lint
         # --exit-zero so style opinions never block a deploy. Real errors are

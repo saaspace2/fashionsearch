@@ -10,6 +10,7 @@ They need no Databricks connection and finish in under a second.
 
 import ast
 import pathlib
+import sys
 
 import pytest
 import yaml
@@ -96,3 +97,44 @@ def test_every_task_has_compute():
                         f"{jname}.{task['task_key']}: references '{key}' "
                         f"which the job never declares")
     assert not problems, "compute configuration errors:\n  " + "\n  ".join(problems)
+
+
+def test_src_modules_import_with_ci_dependencies_only():
+    """
+    Every module under src/ must import using only what CI installs.
+
+    The unit tests are fast because they avoid torch and transformers. But a
+    new module with a heavy top-level import breaks CI with a
+    ModuleNotFoundError at collection time, before a single test runs — and the
+    message points at the module, not at the install step that is really wrong.
+
+    This test fails locally the moment such an import is added, with an
+    explanation of the two ways to fix it.
+    """
+    import importlib
+    import pkgutil
+
+    package_dir = ROOT / "src" / "fashionsearch"
+    if not package_dir.exists():
+        pytest.skip("package not found")
+
+    sys_path_entry = str(ROOT / "src")
+    if sys_path_entry not in sys.path:
+        sys.path.insert(0, sys_path_entry)
+
+    failures = []
+    for module in pkgutil.iter_modules([str(package_dir)]):
+        name = f"fashionsearch.{module.name}"
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError as exc:
+            failures.append(f"{name} needs '{exc.name}' at import time")
+        except Exception as exc:
+            failures.append(f"{name} failed to import: {type(exc).__name__}: {exc}")
+
+    assert not failures, (
+        "modules with dependencies CI does not install:\n  "
+        + "\n  ".join(failures)
+        + "\n\nEither add the package to requirements-ci.txt, or move the import"
+          " inside the function that uses it so importing the module stays cheap."
+    )

@@ -1,0 +1,14 @@
+# Exactly what the CI test job needs — nothing more.
+#
+# Deliberately NOT requirements.txt: that pulls torch, transformers and
+# datasets, which is gigabytes and several minutes on every push, to run tests
+# that never touch them. The unit tests are fast because they have no heavy
+# dependencies, and this file exists to keep it that way.
+#
+# If a test starts failing in CI with ModuleNotFoundError, the import belongs
+# here — or the test belongs somewhere other than the unit suite.
+
+pytest>=8.0
+pyyaml>=6.0
+ruff>=0.5
+numpy>=1.24        # src/fashionsearch/drift.py
