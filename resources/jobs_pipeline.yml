@@ -66,7 +66,9 @@ resources:
           max_retries: 2
           min_retry_interval_millis: 60000
           depends_on: [{ task_key: "03_import_pretrained_model" }]
-          environment_key: cpu
+          # torch, not cpu: this task loads each champion to verify it is
+          # usable before the rest of the pipeline depends on it.
+          environment_key: torch
           notebook_task:
             notebook_path: ../notebooks/04_register_model.py
 

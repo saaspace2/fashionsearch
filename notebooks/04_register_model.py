@@ -82,7 +82,14 @@ CHAMPION = cfg.registry.aliases.champion
 
 
 def champion_status(name: str):
-    """Returns (state, detail). state is 'missing', 'broken' or 'ok'."""
+    """
+    Returns (state, detail). state is 'missing', 'broken', 'unverifiable' or 'ok'.
+
+    The distinction between 'broken' and 'unverifiable' matters. A
+    ModuleNotFoundError means THIS notebook lacks torch — it says nothing about
+    the model. Treating that as "broken" made an earlier version repoint the
+    champion on every single run, quietly climbing to v6.
+    """
     try:
         uri = registry.resolve(cfg, name, CHAMPION)
     except SystemExit:
@@ -91,6 +98,10 @@ def champion_status(name: str):
     try:
         mlflow.pyfunc.load_model(uri)
         return "ok", uri
+    except ModuleNotFoundError as exc:
+        return "unverifiable", (
+            f"cannot check {uri} from this environment: {exc}. "
+            f"Give task 04 the 'torch' environment in jobs_pipeline.yml.")
     except Exception as exc:
         return "broken", f"{uri} does not load: {type(exc).__name__}: {exc}"
 
@@ -102,6 +113,11 @@ for name, result in [(cfg.registry.encoder_model, enc),
     if state == "ok":
         print(f"{name}: champion loads fine ({detail}) — leaving it alone.")
         print("  Promotion of the new version is the gate's decision, not this notebook's.")
+    elif state == "unverifiable":
+        # Leave the champion alone. Repointing on the strength of a check we
+        # could not run would be worse than not checking.
+        print(f"{name}: champion left in place, could not verify it.")
+        print(f"  {detail}")
     elif state == "missing":
         registry.set_alias(cfg, name, CHAMPION, result["version"])
         print(f"{name}: no champion existed — bootstrapped @{CHAMPION} "
@@ -118,12 +134,25 @@ for name, result in [(cfg.registry.encoder_model, enc),
 # MAGIC %md ## Verify what downstream notebooks will actually get
 
 # COMMAND ----------
+ok = True
 for name in [cfg.registry.encoder_model, cfg.registry.detector_model]:
     uri = registry.resolve(cfg, name, CHAMPION)
-    mlflow.pyfunc.load_model(uri)
-    print(f"  {name} @{CHAMPION} loads: {uri}")
+    try:
+        mlflow.pyfunc.load_model(uri)
+        print(f"  [PASS] {name} @{CHAMPION} loads: {uri}")
+    except ModuleNotFoundError as exc:
+        ok = False
+        print(f"  [SKIP] {name}: cannot verify here ({exc})")
+    except Exception as exc:
+        raise SystemExit(
+            f"{name} @{CHAMPION} resolves to {uri} but does not load: "
+            f"{type(exc).__name__}: {exc}\n\n"
+            f"Notebook 05 would fail on exactly this. Re-run notebook 03 to log a "
+            f"fresh version, then clear the alias so 04 bootstraps from it:\n"
+            f"    DELETE FROM {cfg.catalog.name}.ml.model_pointers")
 
-print("\nBoth champions load. Notebook 05 will use exactly these.")
+print("\nBoth champions load. Notebook 05 will use exactly these." if ok
+      else "\nVerification skipped — task 04 needs the 'torch' environment to run it.")
 
 # COMMAND ----------
 if enc["mode"] == "fallback":
