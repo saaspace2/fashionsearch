@@ -14,10 +14,6 @@ resources:
       email_notifications:
         on_failure: ["${var.alert_email}"]
 
-      parameters:
-        - name: sample_size
-          default: "2000"
-
       tasks:
         - task_key: "00_unity_catalog_setup"
           # Serverless environment fetches occasionally 404. Retry rather
@@ -37,8 +33,9 @@ resources:
           environment_key: hf
           notebook_task:
             notebook_path: ../notebooks/01_ingest_data.py
-            base_parameters:
-              sample_size: "{{job.parameters.sample_size}}"
+            # No sample_size here on purpose. It lives in config.yaml, and a job
+            # parameter would silently override it — which is exactly what
+            # happened when config said 10000 and the workflow passed 2000.
 
         - task_key: "02_prepare_eval_set"
           # Serverless environment fetches occasionally 404. Retry rather

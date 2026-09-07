@@ -70,6 +70,16 @@ def register(cfg, model_uri: str, name: str, description: str = "") -> dict:
     import mlflow
     from mlflow.tracking import MlflowClient
 
+    # Databricks documents this for exactly the failure we hit: registering to
+    # UC uploads artifacts to managed storage and gets S3 AccessDenied. Setting
+    # this makes MLflow route the upload through the Databricks SDK instead of
+    # boto3, which uses different credentials and often succeeds where the
+    # direct S3 path is denied.
+    #
+    # Harmless if UC was already working, so it is set unconditionally.
+    import os
+    os.environ["MLFLOW_USE_DATABRICKS_SDK_MODEL_ARTIFACTS_REPO_FOR_UC"] = "true"
+
     try:
         mlflow.set_registry_uri("databricks-uc")
         mv = mlflow.register_model(model_uri=model_uri, name=name)

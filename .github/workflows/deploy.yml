@@ -29,9 +29,6 @@ on:
         description: 'Run the full pipeline (uncheck to only deploy)'
         type: boolean
         default: true
-      sample_size:
-        description: 'How many image pairs to ingest'
-        default: '2000'
 
 env:
   DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -93,9 +90,9 @@ jobs:
         if: >-
           !contains(github.event.head_commit.message, '[skip pipeline]')
           && (github.event_name != 'workflow_dispatch' || inputs.run_full_pipeline)
-        run: |
-          databricks bundle run fashion_pipeline -t dev \
-            --params sample_size=${{ inputs.sample_size || '2000' }}
+        # No --params. sample_size comes from config.yaml, which is the single
+        # source of truth. Passing it here would override the file silently.
+        run: databricks bundle run fashion_pipeline -t dev
 
       - name: Where to look next
         if: always()
