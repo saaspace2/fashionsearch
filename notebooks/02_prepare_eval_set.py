@@ -113,26 +113,40 @@ display(spark.sql(f"""
 # COMMAND ----------
 min_q = int(cfg.gate.min_queries_per_slice)
 eval_df = spark.table(table(cfg, "gold", "eval_queries"))
+total = eval_df.count()
 
-print(f"eval queries: {eval_df.count()}   gate floor: {min_q} per protected slice\n")
+print(f"eval queries: {total}   gate floor: {min_q} per protected slice\n")
 
 problems = []
 for dim, value in [tuple(p) for p in cfg.gate.protected_slices]:
     if dim not in eval_df.columns:
-        print(f"  {dim}={value:<10} column not present yet (set by notebook 05)")
+        print(f"  {dim}={value:<10} column not set until notebook 05")
         continue
+
     n = eval_df.filter(F.col(dim) == value).count()
     ok = n >= min_q
-    print(f"  {dim}={value:<10} {n:>4} queries  [{'OK' if ok else 'TOO FEW'}]")
-    if not ok:
-        problems.append(f"{dim}={value} ({n})")
+    share = n / total if total else 0.0
+
+    line = f"  {dim}={value:<10} {n:>5} queries ({share:6.1%})  [{'OK' if ok else 'TOO FEW'}]"
+    if not ok and share > 0:
+        # The useful number: how big the eval set must be for this slice to
+        # clear the floor, given how rare it is in this data.
+        needed = int(min_q / share * 1.15)      # 15% headroom for sampling wobble
+        line += f"  → needs eval_queries ≈ {needed}"
+        problems.append((f"{dim}={value}", n, needed))
+    elif not ok:
+        line += "  → absent from the eval set entirely"
+        problems.append((f"{dim}={value}", n, None))
+    print(line)
 
 if problems:
-    print(f"\nThese will block the gate: {', '.join(problems)}")
-    print("Options, in order of preference:")
-    print("  1. Raise data.sample_size in config.yaml — more data, more of everything")
-    print("  2. Lower gate.min_queries_per_slice — honest only if you accept that a")
-    print("     recall estimate from a handful of queries is noise")
-    print("  3. Edit gate.protected_slices to match what this dataset contains")
-    print("\nDo NOT simply delete the hard slices. They are protected because they")
-    print("are the categories an average would hide.")
+    sizes = [n for _, _, n in problems if n]
+    print(f"\nThe gate will block on: {', '.join(p[0] for p in problems)}")
+    if sizes:
+        print(f"Set data.eval_queries to at least {max(sizes)} in config.yaml.")
+        print("\nThis is close to free here: nothing is trained, so train_pairs is")
+        print("never read. The only cost is embedding time in notebook 05.")
+    print("\nDo not simply delete the hard slices — they are protected precisely")
+    print("because an average would hide them.")
+else:
+    print("\nEvery protected slice has enough queries to measure.")

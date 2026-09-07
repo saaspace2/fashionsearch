@@ -42,7 +42,17 @@ data:
   #
   # Expect roughly 45-75 minutes of embedding on serverless CPU.
   sample_size: 10000
-  eval_queries: 400
+
+  # Nothing is trained in this pipeline — the models are imported already
+  # trained — so gold.train_pairs is never read and the training split is pure
+  # waste. A large eval set is therefore close to free, and strictly better:
+  # every extra query is a better measurement.
+  #
+  # Sizing is driven by the rarest protected slice. Bags are 2.6% of this
+  # dataset, so 500 eval queries gave 13 bags — a Recall@20 estimate with a
+  # standard error near 11 percentage points, which is noise, not a measurement.
+  # 1000 gives roughly 26 bags. Notebook 02 prints the arithmetic.
+  eval_queries: 1000
 
 registry:
   detector_model: fashion_dev.ml.fashion_detector
