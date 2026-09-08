@@ -141,6 +141,22 @@ jobs:
         run: |
           set -e
           CATALOG=$(python -c "import yaml;print(yaml.safe_load(open('config.yaml'))['catalog']['name'])")
+
+          # The setup notebook creates this, but it is deployed code and could
+          # be a version behind. Creating it here as well costs nothing and
+          # means the upload cannot fail on a missing directory.
+          pip install --quiet databricks-sdk
+          python - <<PY
+          from databricks.sdk import WorkspaceClient
+          w = WorkspaceClient()
+          try:
+              w.volumes.create(catalog_name="${CATALOG}", schema_name="silver",
+                               name="kaggle_inbox", volume_type="MANAGED")
+              print("created ${CATALOG}.silver.kaggle_inbox")
+          except Exception as exc:
+              print(f"volume already present or not creatable here: {exc}")
+          PY
+
           VOL="dbfs:/Volumes/${CATALOG}/silver/kaggle_inbox"
           for f in $(find /tmp/out -maxdepth 2 -name '*.parquet' -o -maxdepth 2 -name 'manifest_*.json'); do
             echo "uploading $(basename "$f")"

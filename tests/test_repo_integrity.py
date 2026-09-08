@@ -10,6 +10,7 @@ They need no Databricks connection and finish in under a second.
 
 import ast
 import pathlib
+import re
 import sys
 
 import pytest
@@ -137,4 +138,30 @@ def test_src_modules_import_with_ci_dependencies_only():
         + "\n  ".join(failures)
         + "\n\nEither add the package to requirements-ci.txt, or move the import"
           " inside the function that uses it so importing the module stays cheap."
+    )
+
+
+def test_every_referenced_volume_is_created_by_setup():
+    """
+    Any UC Volume the code writes to must be created by the setup notebook.
+
+    Notebook 05b creates silver.kaggle_inbox, but it runs long after GitHub
+    Actions uploads into that path — so the upload failed with
+    'no such directory'. Creating a resource in the notebook that consumes it
+    is too late when something upstream writes there first.
+    """
+    setup = (ROOT / "src" / "setup" / "00_create_workspace_objects.py").read_text()
+
+    referenced = set()
+    for path in list(ROOT.glob("notebooks/*.py")) + list(ROOT.glob("kaggle/*.py")) \
+            + list(ROOT.glob(".github/workflows/*.yml")):
+        for match in re.finditer(r"/Volumes/[\w$among{}.]*?[\w{}]+/(\w+)/(\w+)",
+                                 path.read_text()):
+            referenced.add((match.group(1), match.group(2)))
+
+    missing = [f"{schema}.{name}" for schema, name in sorted(referenced)
+               if f'"{name}"' not in setup]
+    assert not missing, (
+        "volumes written to but never created by setup:\n  " + "\n  ".join(missing)
+        + "\n\nAdd them to VOLUMES in src/setup/00_create_workspace_objects.py."
     )

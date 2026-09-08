@@ -11,10 +11,14 @@ from pyspark.sql import SparkSession
 SCHEMAS = ["raw", "bronze", "silver", "gold", "ml", "monitoring"]
 
 VOLUMES = [
-    ("raw", "product_images", "Catalogue thumbnails"),
-    ("raw", "post_images",    "Styled / user-generated outfit photos"),
-    ("raw", "query_images",   "Real production queries, sampled"),
-    ("ml",  "artifacts",      "Exported models and index snapshots"),
+    ("raw",    "product_images", "Catalogue thumbnails"),
+    ("raw",    "post_images",    "Styled / user-generated outfit photos"),
+    ("raw",    "query_images",   "Real production queries, sampled"),
+    ("ml",     "artifacts",      "Exported models and index snapshots"),
+    # Where GitHub Actions drops what the Kaggle GPU run produced. Notebook 05b
+    # also creates it, but 05b runs long after the upload — so it has to exist
+    # here, before anything tries to write to it.
+    ("silver", "kaggle_inbox",   "Embeddings and manifests from the Kaggle run"),
 ]
 
 
