@@ -55,7 +55,38 @@ jobs:
             echo "::error::KAGGLE_USERNAME is not set — needed for the kernel id."
             exit 1
           fi
-          kaggle kernels list --mine --page-size 1 >/dev/null
+          # Show what Kaggle actually says. Sending this to /dev/null hides the
+          # one line that explains the failure.
+          echo "token length: ${#KAGGLE_API_TOKEN} characters"
+          case "$KAGGLE_API_TOKEN" in
+            *'"'*|*'{'*)
+              echo "::error::KAGGLE_API_TOKEN looks like the contents of kaggle.json."
+              echo "That is the OLD credential format. Go to"
+              echo "  https://www.kaggle.com/settings/api"
+              echo "and use 'Generate New Token' to get a plain token STRING —"
+              echo "not the downloaded JSON file, and not just the 'key' field."
+              exit 1 ;;
+          esac
+
+          set +e
+          OUT=$(kaggle kernels list --mine --page-size 1 2>&1)
+          CODE=$?
+          set -e
+          echo "$OUT"
+
+          if [ $CODE -ne 0 ]; then
+            echo "::error::Kaggle rejected the token — see the output above."
+            echo ""
+            echo "Most likely causes, in order:"
+            echo "  1. The token was copied with surrounding quotes or whitespace."
+            echo "  2. It is the old kaggle.json 'key' rather than a new API token."
+            echo "  3. It was revoked — generating a new token invalidates the old one."
+            echo ""
+            echo "Verify it locally before pushing again:"
+            echo "  export KAGGLE_API_TOKEN=<token>"
+            echo "  kaggle kernels list --mine"
+            exit 1
+          fi
           echo "authenticated as ${KAGGLE_USERNAME}"
 
       - name: Refresh the private credentials dataset
