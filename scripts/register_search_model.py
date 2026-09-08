@@ -222,7 +222,7 @@ def main():
             artifacts={"detector": args.detector_dir, "encoder": args.encoder_dir},
             signature=infer_signature(example, out_example),
             input_example=example,
-            pip_requirements=["torch", "torchvision", "transformers",
+            pip_requirements=["torch", "torchvision", "transformers<5",
                               "pillow", "timm"],
         )
         model_uri = f"runs:/{run.info.run_id}/search"

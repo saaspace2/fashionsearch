@@ -194,6 +194,39 @@ def build_encoder(repo, device):
             return F.normalize(self.embedding_layer(feats), p=2, dim=1)
 
     model = ImageEncoder().from_pretrained(repo).to(device).eval()
+
+    # Confirm the checkpoint actually landed.
+    #
+    # from_pretrained does not raise when key names do not match — it warns and
+    # leaves those layers at their random initialisation. Under transformers 5.x
+    # that is exactly what happens to this checkpoint, and the result is an
+    # encoder that runs, returns unit-length vectors, and encodes nothing.
+    #
+    # Comparing against a fresh random model catches it: if every parameter is
+    # identical, nothing was loaded.
+    import torch as _t
+    fresh = ImageEncoder()
+    same, total = 0, 0
+    loaded_state = model.state_dict()
+    for name, param in fresh.state_dict().items():
+        if not name.startswith("swin."):
+            continue
+        total += 1
+        if name in loaded_state and _t.equal(param, loaded_state[name].cpu()):
+            same += 1
+
+    if total and same / total > 0.5:
+        raise SystemExit(
+            f"The encoder weights did not load: {same}/{total} Swin parameters "
+            f"are still at random initialisation.\n\n"
+            f"This is almost always a transformers version mismatch. 5.0 renamed "
+            f"the Swin attention layers, and the published checkpoint uses the "
+            f"4.x names. Pin 'transformers<5' in the install cell.\n\n"
+            f"Continuing would produce embeddings from an untrained model — they "
+            f"look completely normal and are meaningless.")
+
+    print(f"  encoder weights verified: {total - same}/{total} Swin parameters "
+          f"differ from random init")
     return model, processor, config
 
 

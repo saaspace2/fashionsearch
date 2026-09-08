@@ -92,21 +92,45 @@ class TestCredentialsAreOptional:
         assert module["push_to_databricks"]("/tmp/x", "fashion_dev", "x") is False
 
 
-def test_no_bare_sys_exit_outside_data_validation():
-    """
-    SystemExit is fine for genuinely unusable input, but not for a missing
-    credential or an odd argv — those must not end a run that has already
-    burned GPU time.
-    """
-    tree = ast.parse(SCRIPT.read_text())
+# Aborting is correct only when continuing would produce results that look
+# fine and are wrong. Both of these qualify:
+#
+#   "image columns"  — the dataset schema is not what the code expects
+#   "did not load"   — the encoder is at random init, so every embedding would
+#                      be meaningless while looking perfectly normal
+#
+# Aborting over a missing credential or an odd argv does NOT qualify: those end
+# a run that has already spent twenty minutes of GPU time, for something the
+# design deliberately does without.
+ALLOWED_ABORTS = ("image columns", "did not load")
+
+
+def test_sys_exit_only_where_continuing_would_mislead():
+    source = SCRIPT.read_text()
+    tree = ast.parse(source)
     offenders = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
-            name = getattr(node.exc.func, "id", "")
-            if name == "SystemExit":
-                text = ast.get_source_segment(SCRIPT.read_text(), node) or ""
-                # Only a schema problem justifies stopping before any work.
-                if "image columns" not in text:
-                    offenders.append(text[:80])
+            if getattr(node.exc.func, "id", "") != "SystemExit":
+                continue
+            text = ast.get_source_segment(source, node) or ""
+            if not any(reason in text for reason in ALLOWED_ABORTS):
+                offenders.append(text[:100])
     assert not offenders, (
-        "SystemExit raised outside input validation:\n  " + "\n  ".join(offenders))
+        "SystemExit raised where continuing would have been fine:\n  "
+        + "\n  ".join(offenders)
+        + f"\n\nOnly these justify aborting: {ALLOWED_ABORTS}")
+
+
+def test_encoder_load_is_verified():
+    """
+    The weight-load check must stay.
+
+    transformers 5.0 renamed the Swin attention layers, and from_pretrained does
+    not raise on a mismatch — it warns and leaves those layers at random
+    initialisation. The result runs, returns unit-length vectors, and encodes
+    nothing. One Kaggle run produced exactly that before this check existed.
+    """
+    source = SCRIPT.read_text()
+    assert "random initialisation" in source or "random init" in source, \
+        "build_encoder no longer verifies that the checkpoint actually loaded"

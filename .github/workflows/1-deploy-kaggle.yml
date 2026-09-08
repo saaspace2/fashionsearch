@@ -173,7 +173,9 @@ jobs:
         # cropping itself.
         run: |
           set -e
-          pip install --quiet mlflow torch torchvision transformers timm pillow databricks-sdk
+          # transformers<5 to match the checkpoint's layer names — see
+          # kaggle/run_on_kaggle.py build_encoder for why this matters.
+          pip install --quiet mlflow torch torchvision 'transformers<5' timm pillow databricks-sdk
 
           ENC=$(find /tmp/out -type d -name encoder_artifact | head -1)
           DET=$(find /tmp/out -type d -name detector_artifact | head -1)
