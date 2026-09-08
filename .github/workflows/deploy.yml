@@ -17,8 +17,14 @@ name: 1 · Setup — Databricks and Kaggle
 #                                          evaluate, gate, serve
 #
 # Required GitHub secrets:
-#   KAGGLE_USERNAME  KAGGLE_KEY  DATABRICKS_HOST  DATABRICKS_TOKEN
-#   GH_DISPATCH_TOKEN  (a PAT with 'repo' scope, so Kaggle can call back)
+#   KAGGLE_API_TOKEN   from kaggle.com/settings/api -> Generate New Token
+#   KAGGLE_USERNAME    your Kaggle username (used to build the kernel id)
+#   DATABRICKS_HOST    DATABRICKS_TOKEN
+#   GH_DISPATCH_TOKEN  a PAT with 'repo' scope, so Kaggle can call back
+#
+# NOTE: the Kaggle CLI moved from the old username+key pair to a single
+# KAGGLE_API_TOKEN. Supplying only the old pair now fails with
+# "Authentication required to call the Kaggle API".
 
 on:
   push:
@@ -75,14 +81,33 @@ jobs:
       && !contains(github.event.head_commit.message, '[skip kaggle]')
     runs-on: ubuntu-latest
     env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - run: pip install --upgrade kaggle
+
+      - name: Check Kaggle authentication before doing anything
+        # The CLI prints a long help message and exits non-zero when it cannot
+        # authenticate, which is easy to mistake for a different problem. Fail
+        # here with a message that names the actual fix.
+        run: |
+          if [ -z "$KAGGLE_API_TOKEN" ]; then
+            echo "::error::KAGGLE_API_TOKEN is not set."
+            echo "Get one at https://www.kaggle.com/settings/api -> Generate New Token,"
+            echo "then add it as a GitHub secret named KAGGLE_API_TOKEN."
+            echo "The old KAGGLE_USERNAME + KAGGLE_KEY pair no longer authenticates."
+            exit 1
+          fi
+          if [ -z "$KAGGLE_USERNAME" ]; then
+            echo "::error::KAGGLE_USERNAME is not set — needed to build the kernel id."
+            exit 1
+          fi
+          kaggle kernels list --mine --page-size 1 >/dev/null
+          echo "Kaggle authentication OK for ${KAGGLE_USERNAME}"
 
       - name: Publish credentials as a private Kaggle dataset
         # Kaggle Secrets are UI-managed and stripped on every CLI push, so a
@@ -117,11 +142,15 @@ jobs:
           fi
           sleep 20      # Kaggle needs a moment before the dataset is attachable
 
-      - name: Push the kernel — this also starts it on a T4
+      - name: Build the notebook and push it — this also starts it on a T4
         run: |
           set -e
           mkdir -p /tmp/kernel
-          cp kaggle/run_on_kaggle.py /tmp/kernel/
+
+          # A real .ipynb, so what lands on Kaggle is a notebook you can open,
+          # read and re-run cell by cell. Generated from run_on_kaggle.py, which
+          # stays the single source of truth.
+          python kaggle/build_notebook.py /tmp/kernel/fashionsearch-gpu.ipynb
 
           # Generated here so the username comes from the secret and nobody has
           # to edit a committed file.
@@ -129,9 +158,9 @@ jobs:
           {
             "id": "${KAGGLE_USERNAME}/fashionsearch-gpu",
             "title": "FashionSearch GPU",
-            "code_file": "run_on_kaggle.py",
+            "code_file": "fashionsearch-gpu.ipynb",
             "language": "python",
-            "kernel_type": "script",
+            "kernel_type": "notebook",
             "is_private": true,
             "enable_gpu": true,
             "enable_internet": true,
@@ -142,7 +171,14 @@ jobs:
           }
           JSON
 
-          kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4
+          OUT=$(kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4 2>&1) || true
+          echo "$OUT"
+          # The CLI sometimes prints an error and still exits zero, which would
+          # let this job go green having done nothing.
+          if echo "$OUT" | grep -qiE 'error|forbidden|403|404|not created|authentication'; then
+            echo "::error::Kernel push failed — see output above."
+            exit 1
+          fi
 
           echo ""
           echo "=================================================================="
