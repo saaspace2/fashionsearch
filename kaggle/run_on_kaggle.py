@@ -55,14 +55,43 @@ DEFAULTS = {
 }
 
 
+def in_notebook() -> bool:
+    """True inside a Jupyter/IPython kernel, which is what Kaggle runs."""
+    try:
+        from IPython import get_ipython
+        return get_ipython() is not None
+    except Exception:
+        return False
+
+
 def parse_args():
+    """
+    Build the config, from the command line when there is one.
+
+    A Kaggle notebook IS a Jupyter kernel, and sys.argv there is the kernel's
+    own launch flags:
+
+        ['.../ipykernel_launcher.py', '-f', '.../kernel-abc123.json']
+
+    Plain parse_args() rejects those, prints usage and calls sys.exit(2) — on
+    the first line of main(), before any work, killing the kernel in seconds
+    with nothing in the log but ERROR.
+
+    So: no argv at all in a notebook, and parse_known_args elsewhere so an
+    unexpected flag is ignored rather than fatal.
+    """
     p = argparse.ArgumentParser()
     for key, value in DEFAULTS.items():
         if isinstance(value, bool):
             p.add_argument(f"--{key}", action="store_true", default=value)
         else:
             p.add_argument(f"--{key}", type=type(value), default=value)
-    return p.parse_args()
+
+    argv = [] if in_notebook() else sys.argv[1:]
+    args, unknown = p.parse_known_args(argv)
+    if unknown:
+        print(f"ignoring unrecognised arguments: {unknown}")
+    return args
 
 
 def on_kaggle() -> bool:

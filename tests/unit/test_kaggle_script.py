@@ -1,0 +1,112 @@
+"""
+Tests for the Kaggle script.
+
+This file exists because of a specific bug that cost several failed runs.
+
+`run_on_kaggle.py` is executed two ways: as a script from a terminal, and as a
+cell inside a Kaggle notebook. A Kaggle notebook is a Jupyter kernel, and
+sys.argv there is the kernel's own launch flags:
+
+    ['.../ipykernel_launcher.py', '-f', '.../kernel-abc123.json']
+
+argparse.parse_args() rejected those, printed usage and called sys.exit(2) — on
+the first line of main(), before any work. The kernel died in seconds with
+nothing in the log but ERROR, which looks like almost anything.
+
+Nothing in CI executed the notebook path, so nothing caught it. These tests do.
+"""
+
+import ast
+import pathlib
+import sys
+import types
+
+import pytest
+
+SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "kaggle" / "run_on_kaggle.py"
+
+
+@pytest.fixture
+def module():
+    """Load the script without running main()."""
+    src = SCRIPT.read_text()
+    ns = {"__name__": "run_on_kaggle_undertest"}
+    exec(compile(src, str(SCRIPT), "exec"), ns)
+    return ns
+
+
+@pytest.fixture
+def pretend_notebook(monkeypatch):
+    """Make in_notebook() return True, as it does on Kaggle."""
+    fake = types.ModuleType("IPython")
+    fake.get_ipython = lambda: object()
+    monkeypatch.setitem(sys.modules, "IPython", fake)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["/opt/conda/lib/python3.11/site-packages/ipykernel_launcher.py",
+         "-f", "/root/.local/share/jupyter/runtime/kernel-abc123.json"])
+
+
+def test_script_is_valid_python():
+    ast.parse(SCRIPT.read_text())
+
+
+class TestArgumentParsing:
+    def test_survives_a_jupyter_kernel_argv(self, module, pretend_notebook):
+        """The regression this file was written for."""
+        args = module["parse_args"]()
+        assert args.catalog
+        assert args.sample_size > 0
+
+    def test_command_line_flags_still_work(self, module, monkeypatch):
+        monkeypatch.setattr(sys, "argv",
+                            ["run_on_kaggle.py", "--sample_size", "500"])
+        assert module["parse_args"]().sample_size == 500
+
+    def test_unknown_flags_are_ignored_not_fatal(self, module, monkeypatch):
+        # A stray flag should not kill a run that is about to do 20 minutes of
+        # GPU work.
+        monkeypatch.setattr(sys, "argv",
+                            ["run_on_kaggle.py", "--not-a-real-flag", "x"])
+        assert module["parse_args"]().catalog
+
+
+class TestCredentialsAreOptional:
+    """
+    Missing credentials are the NORMAL path: Kaggle holds none by design, and
+    GitHub Actions does the Databricks work. Raising here would kill a run that
+    had already finished its GPU work — the one outcome worth avoiding.
+    """
+
+    def test_get_secret_returns_none_rather_than_raising(self, module, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+        assert module["get_secret"]("DATABRICKS_HOST") is None
+
+    def test_get_secret_reads_the_environment(self, module, monkeypatch):
+        monkeypatch.setenv("DATABRICKS_HOST", "https://example.databricks.com")
+        assert module["get_secret"]("DATABRICKS_HOST") == "https://example.databricks.com"
+
+    def test_upload_declines_quietly_without_credentials(self, module, monkeypatch):
+        monkeypatch.delenv("DATABRICKS_HOST", raising=False)
+        monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
+        assert module["push_to_databricks"]("/tmp/x", "fashion_dev", "x") is False
+
+
+def test_no_bare_sys_exit_outside_data_validation():
+    """
+    SystemExit is fine for genuinely unusable input, but not for a missing
+    credential or an odd argv — those must not end a run that has already
+    burned GPU time.
+    """
+    tree = ast.parse(SCRIPT.read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            name = getattr(node.exc.func, "id", "")
+            if name == "SystemExit":
+                text = ast.get_source_segment(SCRIPT.read_text(), node) or ""
+                # Only a schema problem justifies stopping before any work.
+                if "image columns" not in text:
+                    offenders.append(text[:80])
+    assert not offenders, (
+        "SystemExit raised outside input validation:\n  " + "\n  ".join(offenders))
