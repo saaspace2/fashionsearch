@@ -69,29 +69,21 @@ def on_kaggle() -> bool:
     return os.path.exists("/kaggle/working")
 
 
-def get_secret(name: str) -> str:
+def get_secret(name: str):
     """
-    Find a credential, in three places, in this order.
+    Find a credential, or return None. Never raises.
 
-    1. An attached private Kaggle Dataset
-    2. Kaggle Secrets (Add-ons -> Secrets)
-    3. An environment variable, so this also runs locally
+    Missing credentials are the NORMAL path here, not a failure. Kaggle
+    deliberately holds none: dataset writes are refused without phone
+    verification, and Kaggle Secrets are stripped on every CLI push. So the
+    kernel does pure GPU compute and GitHub Actions does the Databricks work.
 
-    Order matters. Kaggle Secrets are managed in the UI and are **stripped
-    every time a kernel is pushed by the CLI**, so a kernel that relied on them
-    would lose its credentials on every automated push and abort.
-
-    Dataset attachments are part of kernel-metadata.json, which the kernel owns,
-    so they survive CLI pushes. That single difference is what makes a fully
-    automatic run possible rather than a manual one.
-
-    The trade is that the dataset holds the token in cleartext. It is private,
-    readable only by you, and the token should be short-lived — but it is a real
-    trade rather than a free win, so it is stated here rather than buried.
+    Raising on a missing secret would kill a run that has already done all its
+    GPU work and written every artifact — the one outcome worth avoiding.
     """
-    import glob
+    import glob as _glob
 
-    for path in glob.glob("/kaggle/input/*/credentials.json"):
+    for path in _glob.glob("/kaggle/input/*/credentials.json"):
         try:
             with open(path) as fh:
                 value = json.load(fh).get(name)
@@ -106,18 +98,7 @@ def get_secret(name: str) -> str:
     except Exception:
         pass
 
-    value = os.environ.get(name)
-    if value:
-        return value
-
-    raise SystemExit(
-        f"{name} not found.\n\n"
-        f"Automatic runs read it from an attached private dataset, created by "
-        f"the deploy-kaggle GitHub workflow. Check that KAGGLE_USERNAME, "
-        f"KAGGLE_KEY, DATABRICKS_HOST and DATABRICKS_TOKEN are all set as GitHub "
-        f"secrets.\n\n"
-        f"To run this kernel by hand instead, add the secret under "
-        f"Add-ons -> Secrets and tick it.")
+    return os.environ.get(name)
 
 
 # --------------------------------------------------------------------------
@@ -359,13 +340,13 @@ def connect_mlflow(catalog: str) -> bool:
     """
     import mlflow
 
-    try:
-        host = get_secret("DATABRICKS_HOST").rstrip("/")
-        token = get_secret("DATABRICKS_TOKEN")
-    except SystemExit as exc:
-        print(f"{exc}\n\nContinuing without Databricks. Embeddings will still be "
-              f"written locally, but nothing will be registered.")
+    host = get_secret("DATABRICKS_HOST")
+    token = get_secret("DATABRICKS_TOKEN")
+    if not host or not token:
+        print("No Databricks credentials — skipping remote registration.")
+        print("The artifacts are in the kernel output; GitHub registers them.")
         return False
+    host = host.rstrip("/")
 
     os.environ["DATABRICKS_HOST"] = host
     os.environ["DATABRICKS_TOKEN"] = token
@@ -511,6 +492,7 @@ def register_encoder(encoder, processor, config, args, manifest):
 # --------------------------------------------------------------------------
 
 def push_to_databricks(local_path, catalog, remote_name):
+    """Upload one file to a UC Volume. Returns False if not configured."""
     """
     Upload one file into a Unity Catalog Volume.
 
@@ -518,11 +500,13 @@ def push_to_databricks(local_path, catalog, remote_name):
     never collide, and Databricks only has to read a Parquet file — no torch,
     no GPU-shaped library ever gets imported on that side.
     """
-    from databricks.sdk import WorkspaceClient
-
-    host = get_secret("DATABRICKS_HOST").rstrip("/")
+    host = get_secret("DATABRICKS_HOST")
     token = get_secret("DATABRICKS_TOKEN")
-    w = WorkspaceClient(host=host, token=token)
+    if not host or not token:
+        return False
+
+    from databricks.sdk import WorkspaceClient
+    w = WorkspaceClient(host=host.rstrip("/"), token=token)
 
     remote = f"/Volumes/{catalog}/silver/kaggle_inbox/{remote_name}"
     print(f"uploading {local_path} -> {remote}")
@@ -530,7 +514,7 @@ def push_to_databricks(local_path, catalog, remote_name):
     with open(local_path, "rb") as fh:
         w.files.upload(remote, fh, overwrite=True)
     print("  uploaded")
-    return remote
+    return True
 
 
 def trigger_github(manifest: dict) -> None:
@@ -553,13 +537,11 @@ def trigger_github(manifest: dict) -> None:
     import urllib.error
     import urllib.request
 
-    try:
-        token = get_secret("GH_DISPATCH_TOKEN")
-        repo = get_secret("GH_REPO")
-    except SystemExit:
-        print("\nNo GitHub credentials — not triggering the Databricks pipeline.")
-        print("Add GH_DISPATCH_TOKEN and GH_REPO as GitHub secrets, or start the")
-        print("pipeline by hand:  databricks bundle run fashion_pipeline -t dev")
+    token = get_secret("GH_DISPATCH_TOKEN")
+    repo = get_secret("GH_REPO")
+    if not token or not repo:
+        print("\nNo GitHub credentials here — expected. The workflow that pushed")
+        print("this kernel is waiting for it and will continue on its own.")
         return
 
     payload = _json.dumps({
@@ -717,13 +699,18 @@ def main():
     # If credentials happen to be available (Kaggle Secrets, or a run started by
     # hand), upload directly — it saves GitHub a download. Otherwise everything
     # is in the kernel output and GitHub collects it. Either path works.
+    uploaded = False
     try:
-        for local, remote in paths:
-            push_to_databricks(local, args.catalog, remote)
+        uploaded = all(push_to_databricks(local, args.catalog, remote)
+                       for local, remote in paths)
+    except Exception as exc:
+        print(f"\nupload skipped: {type(exc).__name__}: {exc}")
+
+    if uploaded:
         print("\nUploaded directly to Databricks.")
-    except SystemExit:
-        print("\nNo Databricks credentials here — that is the normal path.")
-        print("Everything is in the kernel output; GitHub Actions collects it,")
+    else:
+        print("\nNo Databricks credentials here — that is the expected path.")
+        print("Everything is in the kernel output. GitHub Actions collects it,")
         print("uploads the embeddings and registers the encoder.")
 
     print("\nOutputs written:")

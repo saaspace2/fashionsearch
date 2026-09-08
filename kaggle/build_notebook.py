@@ -70,6 +70,28 @@ def cells():
 
     yield {
         "cell_type": "markdown", "metadata": {},
+        "source": [
+            "## Dependencies\n\n",
+            "Kaggle images ship torch and transformers but not always a current\n",
+            "`datasets`. Installing here rather than assuming — a missing import\n",
+            "kills the kernel in the first few seconds, before any GPU work.\n",
+        ],
+    }
+    yield {
+        "cell_type": "code", "metadata": {"trusted": True},
+        "execution_count": None, "outputs": [],
+        "source": [
+            "!pip install -q --upgrade datasets huggingface_hub pyarrow\n",
+            "\n",
+            "import datasets, transformers, torch\n",
+            "print('datasets     :', datasets.__version__)\n",
+            "print('transformers :', transformers.__version__)\n",
+            "print('torch        :', torch.__version__)\n",
+        ],
+    }
+
+    yield {
+        "cell_type": "markdown", "metadata": {},
         "source": ["## The pipeline code\n\n",
                    "Everything from `kaggle/run_on_kaggle.py`.\n"],
     }
@@ -87,7 +109,22 @@ def cells():
     yield {
         "cell_type": "code", "metadata": {"trusted": True},
         "execution_count": None, "outputs": [],
-        "source": ["main()\n"],
+        "source": [
+            "import traceback\n",
+            "\n",
+            "try:\n",
+            "    main()\n",
+            "except Exception:\n",
+            "    # Print and carry on rather than dying silently. Anything already\n",
+            "    # written to /kaggle/working survives as kernel output, so a late\n",
+            "    # failure does not throw away the GPU work.\n",
+            "    traceback.print_exc()\n",
+            "\n",
+            "import os\n",
+            "print('\\nfiles in /kaggle/working:')\n",
+            "for f in sorted(os.listdir('/kaggle/working')):\n",
+            "    print(' ', f)\n",
+        ],
     }
 
 
