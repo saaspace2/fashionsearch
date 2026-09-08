@@ -177,18 +177,67 @@ def main():
                                  "gate_status", "not_evaluated")
     print(f"registered {args.model_name} version {result.version} in Unity Catalog")
 
+    # Load it back before trusting it.
+    #
+    # mlflow.register_model creates the version record FIRST and uploads the
+    # artifacts after. If the upload fails — an expired token, a scoped token,
+    # a network drop — Unity Catalog is left with a version that resolves but
+    # cannot be downloaded. Every later notebook then fails with
+    # "400 Bad Request" on HeadObject, three steps away from the actual cause.
+    #
+    # Checking here costs seconds and fails at the point of the mistake.
+    print("verifying the registered version can be loaded back ...")
+    try:
+        reloaded = mlflow.pyfunc.load_model(f"models:/{args.model_name}/{result.version}")
+        check = reloaded.predict(example)
+        got = int(check.shape[1])
+        if got != dim:
+            raise RuntimeError(f"expected {dim} dimensions, got {got}")
+        print(f"  verified: loads and returns {got} numbers")
+    except Exception as exc:
+        raise SystemExit(
+            f"\nVersion {result.version} was registered but cannot be loaded:\n"
+            f"  {type(exc).__name__}: {exc}\n\n"
+            f"Its artifacts did not upload completely, so the version record "
+            f"exists while the files do not. Delete it before retrying, or the "
+            f"broken version stays in Unity Catalog:\n\n"
+            f"  from mlflow.tracking import MlflowClient\n"
+            f"  MlflowClient().delete_model_version("
+            f"'{args.model_name}', '{result.version}')\n\n"
+            f"Then check DATABRICKS_TOKEN is unscoped and re-run.")
+
     # Bootstrap the champion only if there is none. After that the Databricks
     # gate decides promotion — a model does not get to promote itself past
     # evaluation just because it is newer.
-    try:
-        current = client.get_model_version_by_alias(args.model_name, args.champion_alias)
-        print(f"champion is already v{current.version} — left alone. "
+    def champion_loads():
+        """True only if the current champion can actually be downloaded."""
+        try:
+            current = client.get_model_version_by_alias(
+                args.model_name, args.champion_alias)
+        except Exception:
+            return False, None
+        try:
+            mlflow.pyfunc.load_model(
+                f"models:/{args.model_name}@{args.champion_alias}")
+            return True, current.version
+        except Exception as exc:
+            print(f"  champion v{current.version} does not load: "
+                  f"{type(exc).__name__}")
+            return False, current.version
+
+    ok, current_version = champion_loads()
+    if ok:
+        print(f"champion is already v{current_version} and loads — left alone. "
               f"The gate decides whether v{result.version} replaces it.")
-    except Exception:
+    else:
+        # A champion that cannot be downloaded is broken infrastructure, not a
+        # quality judgement. Leaving it in place blocks the whole pipeline on a
+        # model nobody can use.
         client.set_registered_model_alias(args.model_name, args.champion_alias,
                                           result.version)
-        print(f"no champion existed — bootstrapped @{args.champion_alias} "
-              f"= v{result.version}")
+        reason = ("no champion existed" if current_version is None
+                  else f"v{current_version} could not be loaded")
+        print(f"{reason} — pointed @{args.champion_alias} at v{result.version}")
 
     with open("registered.json", "w") as fh:
         json.dump({"model": args.model_name, "version": int(result.version)}, fh)
