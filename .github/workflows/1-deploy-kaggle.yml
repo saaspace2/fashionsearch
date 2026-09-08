@@ -1,21 +1,25 @@
-name: 1 · Deploy code to Kaggle
+name: 1 · Kaggle GPU run
 
-# On every push: rebuild the notebook from kaggle/run_on_kaggle.py, refresh the
-# private credentials dataset, and push both to Kaggle.
+# Push the notebook, run it on a T4, collect the results, and hand them to
+# Databricks. Everything from one `git push`.
 #
-# Pushing also STARTS the kernel — the Kaggle CLI has no push-without-run. The
-# GPU job therefore begins here, and when it finishes it calls back into GitHub
-# and workflow 3 takes over.
+# KAGGLE HOLDS NO CREDENTIALS. That is deliberate.
 #
-# Required GitHub secrets:
-#   KAGGLE_API_TOKEN    kaggle.com/settings/api -> Generate New Token
-#   KAGGLE_USERNAME     used to build the kernel id
-#   DATABRICKS_HOST     DATABRICKS_TOKEN     passed through to the kernel
-#   GH_DISPATCH_TOKEN   a PAT with 'repo' scope, so Kaggle can call back
+# Getting credentials onto Kaggle needs either a private Dataset — refused with
+# 403 on accounts without phone verification — or Kaggle Secrets, which are
+# stripped on every CLI push and would need re-ticking by hand each time. Both
+# defeat the point of a pipeline.
 #
-# The CLI moved from the old KAGGLE_USERNAME + KAGGLE_KEY pair to a single
-# KAGGLE_API_TOKEN. The old pair now fails with
-# "Authentication required to call the Kaggle API".
+# So Kaggle does pure GPU compute and writes to its kernel output. This workflow
+# downloads that output, uploads the embeddings, and registers the encoder in
+# Unity Catalog itself.
+#
+# Registering from here works for the same reason it would have worked from
+# Kaggle: a GitHub runner is outside Databricks, so the upload uses the REST API
+# with a token rather than a cluster's assumed IAM role — and it is that role
+# which the workspace bucket policy explicitly denies.
+#
+# Secrets: KAGGLE_API_TOKEN  KAGGLE_USERNAME  DATABRICKS_HOST  DATABRICKS_TOKEN
 
 on:
   push:
@@ -23,17 +27,22 @@ on:
     paths:
       - 'kaggle/**'
       - 'src/**'
+      - 'scripts/**'
       - 'config.yaml'
   workflow_dispatch:
 
+env:
+  KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+  KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
 jobs:
-  push_to_kaggle:
-    name: Push the notebook and start the GPU run
+  gpu_run:
+    name: Run on Kaggle, then hand results to Databricks
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     if: "!contains(github.event.head_commit.message, '[skip kaggle]')"
-    env:
-      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,158 +50,27 @@ jobs:
           python-version: '3.11'
       - run: pip install --upgrade kaggle
 
-      - name: Check Kaggle authentication first
-        # The CLI prints a long help message and exits non-zero when it cannot
-        # authenticate, which reads like a different problem entirely. Fail here
-        # with a message that names the fix.
+      - name: Check Kaggle authentication
         run: |
-          if [ -z "$KAGGLE_API_TOKEN" ]; then
+          # Trim whitespace. A secret pasted with a trailing newline fails in a
+          # way that is invisible in the log and works fine locally.
+          TOKEN="$(echo -n "$KAGGLE_API_TOKEN" | tr -d '[:space:]')"
+          echo "KAGGLE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          if [ -z "$TOKEN" ]; then
             echo "::error::KAGGLE_API_TOKEN is not set."
-            echo "Get one at https://www.kaggle.com/settings/api -> Generate New Token."
+            echo "kaggle.com/settings/api -> Generate New Token"
             exit 1
           fi
-          if [ -z "$KAGGLE_USERNAME" ]; then
-            echo "::error::KAGGLE_USERNAME is not set — needed for the kernel id."
-            exit 1
-          fi
-          # Show what Kaggle actually says. Sending this to /dev/null hides the
-          # one line that explains the failure.
-          echo "token length: ${#KAGGLE_API_TOKEN} characters"
-          case "$KAGGLE_API_TOKEN" in
-            *'"'*|*'{'*)
-              echo "::error::KAGGLE_API_TOKEN looks like the contents of kaggle.json."
-              echo "That is the OLD credential format. Go to"
-              echo "  https://www.kaggle.com/settings/api"
-              echo "and use 'Generate New Token' to get a plain token STRING —"
-              echo "not the downloaded JSON file, and not just the 'key' field."
-              exit 1 ;;
-          esac
-
-          set +e
-          OUT=$(kaggle kernels list --mine --page-size 1 2>&1)
-          CODE=$?
-          set -e
-          echo "$OUT"
-
-          if [ $CODE -ne 0 ]; then
-            echo "::error::Kaggle rejected the token — see the output above."
-            echo ""
-            echo "Most likely causes, in order:"
-            echo "  1. The token was copied with surrounding quotes or whitespace."
-            echo "  2. It is the old kaggle.json 'key' rather than a new API token."
-            echo "  3. It was revoked — generating a new token invalidates the old one."
-            echo ""
-            echo "Verify it locally before pushing again:"
-            echo "  export KAGGLE_API_TOKEN=<token>"
-            echo "  kaggle kernels list --mine"
-            exit 1
-          fi
+          KAGGLE_API_TOKEN="$TOKEN" kaggle kernels list --mine --page-size 1
           echo "authenticated as ${KAGGLE_USERNAME}"
 
-      - name: Refresh the private credentials dataset
-        # Kaggle Secrets are UI-managed and stripped on every CLI push, so a
-        # kernel relying on them loses its credentials the moment this runs.
-        # Dataset attachments live in kernel-metadata.json, which the kernel
-        # owns, and do survive.
-        #
-        # The dataset is private. Use a short-lived Databricks token.
-        id: creds
-        continue-on-error: true
-        run: |
-          set -e
-          mkdir -p /tmp/creds
-          cat > /tmp/creds/credentials.json <<JSON
-          {
-            "DATABRICKS_HOST": "${{ secrets.DATABRICKS_HOST }}",
-            "DATABRICKS_TOKEN": "${{ secrets.DATABRICKS_TOKEN }}",
-            "GH_DISPATCH_TOKEN": "${{ secrets.GH_DISPATCH_TOKEN }}",
-            "GH_REPO": "${{ github.repository }}"
-          }
-          JSON
-          cat > /tmp/creds/dataset-metadata.json <<JSON
-          {
-            "title": "fashionsearch credentials",
-            "id": "${KAGGLE_USERNAME}/fashionsearch-credentials",
-            "licenses": [{ "name": "CC0-1.0" }]
-          }
-          JSON
-
-          # Try create first and read what Kaggle says, rather than probing with
-          # `datasets status` — that returns 403 for a dataset that does not
-          # exist, which is indistinguishable from a permissions problem and
-          # sent the previous version down the wrong branch.
-          set +e
-          OUT=$(kaggle datasets create -p /tmp/creds --dir-mode zip 2>&1)
-          CODE=$?
-          set -e
-          echo "$OUT"
-
-          if echo "$OUT" | grep -qi 'already exists\|already in use'; then
-            echo "Dataset exists — pushing a new version."
-            set +e
-            OUT=$(kaggle datasets version -p /tmp/creds -m "rotate ${{ github.sha }}" --dir-mode zip 2>&1)
-            CODE=$?
-            set -e
-            echo "$OUT"
-          fi
-
-          if [ $CODE -ne 0 ]; then
-            echo "::warning::Could not publish the credentials dataset."
-            if echo "$OUT" | grep -q '403'; then
-              echo ""
-              echo "A 403 here almost always means the Kaggle account is not"
-              echo "phone-verified. Creating datasets through the API requires it."
-              echo "Verify at https://www.kaggle.com/settings -> Phone verification,"
-              echo "then re-run this workflow."
-              echo ""
-              echo "Falling back to Kaggle Secrets — see the next step."
-            fi
-            exit 1
-          fi
-
-          echo "credentials published"
-          sleep 20      # Kaggle needs a moment before the dataset is attachable
-
-      - name: If that failed, explain the fallback
-        if: steps.creds.outcome == 'failure'
-        run: |
-          echo "=================================================================="
-          echo " The credentials dataset could not be created, so the kernel will"
-          echo " be pushed WITHOUT it. The GPU work will still run, but the last"
-          echo " two steps — registering to Unity Catalog and calling back into"
-          echo " GitHub — need credentials and will be skipped."
-          echo ""
-          echo " To supply them the other way, once:"
-          echo "   1. kaggle.com/settings -> Secrets -> add DATABRICKS_HOST,"
-          echo "      DATABRICKS_TOKEN, GH_DISPATCH_TOKEN and GH_REPO"
-          echo "   2. Open the kernel -> Add-ons -> Secrets -> tick all four"
-          echo "   3. Run All"
-          echo ""
-          echo " run_on_kaggle.py already looks in Kaggle Secrets when no dataset"
-          echo " is attached, so nothing else needs changing."
-          echo "=================================================================="
-
-      - name: Build the notebook and push it
-        env:
-          CREDS_OK: ${{ steps.creds.outcome }}
+      - name: Build the notebook and push it — this also starts it
         run: |
           set -e
           mkdir -p /tmp/kernel
-
-          # Attaching a dataset that does not exist makes the push fail, so only
-          # reference it when the previous step actually succeeded.
-          if [ "$CREDS_OK" = "success" ]; then
-            DATASET_SOURCE="\"${KAGGLE_USERNAME}/fashionsearch-credentials\""
-          else
-            DATASET_SOURCE=""
-            echo "No credentials dataset — pushing without it."
-          fi
-
-          # A real .ipynb, so what lands on Kaggle opens as a notebook you can
-          # read and re-run cell by cell. run_on_kaggle.py stays the source of
-          # truth — testable, diffable, editable in an editor.
           python kaggle/build_notebook.py /tmp/kernel/fashionsearch-gpu.ipynb
 
+          # No dataset_sources: the kernel needs no credentials.
           cat > /tmp/kernel/kernel-metadata.json <<JSON
           {
             "id": "${KAGGLE_USERNAME}/fashionsearch-gpu",
@@ -203,28 +81,90 @@ jobs:
             "is_private": true,
             "enable_gpu": true,
             "enable_internet": true,
-            "dataset_sources": [${DATASET_SOURCE}],
+            "dataset_sources": [],
             "competition_sources": [],
-            "kernel_sources": [],
-            "model_sources": []
+            "kernel_sources": []
           }
           JSON
 
           OUT=$(kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4 2>&1) || true
           echo "$OUT"
-          # The CLI sometimes prints an error and still exits zero, which would
-          # let this job go green having done nothing at all.
+          # The CLI sometimes prints an error and exits zero, which would let
+          # this job go green having done nothing.
           if echo "$OUT" | grep -qiE 'error|forbidden|403|404|not created|authentication required'; then
-            echo "::error::Kernel push failed — see output above."
+            echo "::error::Kernel push failed — see above."
             exit 1
           fi
+          echo "running: https://kaggle.com/code/${KAGGLE_USERNAME}/fashionsearch-gpu"
 
-          echo ""
-          echo "=================================================================="
-          echo " Notebook pushed and running on a T4:"
-          echo "   https://kaggle.com/code/${KAGGLE_USERNAME}/fashionsearch-gpu"
-          echo ""
-          echo " It embeds the catalogue, registers the encoder in Unity Catalog,"
-          echo " uploads the vectors, then calls back into GitHub."
-          echo " Workflow 3 takes over from there."
-          echo "=================================================================="
+      - name: Wait for it to finish
+        run: |
+          set -e
+          KERNEL="${KAGGLE_USERNAME}/fashionsearch-gpu"
+          for i in $(seq 1 100); do        # 100 x 30s = 50 minutes
+            sleep 30
+            STATUS=$(kaggle kernels status "$KERNEL" 2>&1 || true)
+            echo "[$i] $STATUS"
+            case "$STATUS" in
+              *complete*|*COMPLETE*) echo "finished"; exit 0 ;;
+              *error*|*ERROR*|*cancel*)
+                echo "::error::Kaggle run failed. Log: https://kaggle.com/code/$KERNEL"
+                exit 1 ;;
+            esac
+          done
+          echo "::error::Timed out after 50 minutes."
+          exit 1
+
+      - name: Download what Kaggle produced
+        run: |
+          set -e
+          mkdir -p /tmp/out
+          kaggle kernels output "${KAGGLE_USERNAME}/fashionsearch-gpu" -p /tmp/out
+          find /tmp/out -type f | head -30
+          test -n "$(find /tmp/out -name 'manifest_*.json')" \
+            || { echo "::error::no manifest in the kernel output"; exit 1; }
+
+      - uses: databricks/setup-cli@main
+
+      - name: Make sure the catalog and volumes exist
+        # Workflow 2 also does this, but both workflows start on the same push
+        # and run independently — nothing orders them. On a fresh workspace the
+        # upload below would then fail because the volume does not exist yet.
+        #
+        # Setup is idempotent and takes about a minute, so running it here costs
+        # little and removes the race entirely.
+        run: |
+          databricks bundle deploy -t dev
+          databricks bundle run fashion_setup -t dev
+
+      - name: Upload embeddings to the Unity Catalog volume
+        run: |
+          set -e
+          CATALOG=$(python -c "import yaml;print(yaml.safe_load(open('config.yaml'))['catalog']['name'])")
+          VOL="dbfs:/Volumes/${CATALOG}/silver/kaggle_inbox"
+          for f in $(find /tmp/out -maxdepth 2 -name '*.parquet' -o -maxdepth 2 -name 'manifest_*.json'); do
+            echo "uploading $(basename "$f")"
+            databricks fs cp "$f" "${VOL}/$(basename "$f")" --overwrite
+          done
+
+      - name: Register the encoder in Unity Catalog
+        # From here, not from a Databricks notebook — see the header.
+        run: |
+          set -e
+          pip install --quiet mlflow torch torchvision transformers pillow databricks-sdk
+          ART=$(find /tmp/out -type d -name encoder_artifact | head -1)
+          MAN=$(find /tmp/out -name 'manifest_*.json' | head -1)
+          MODEL=$(python -c "import yaml;print(yaml.safe_load(open('config.yaml'))['registry']['encoder_model'])")
+          python scripts/register_encoder.py \
+            --artifact-dir "$ART" --manifest "$MAN" --model-name "$MODEL"
+
+      - name: Run the Databricks pipeline
+        # Already deployed above.
+        run: databricks bundle run fashion_pipeline -t dev
+
+      - name: Where to look
+        if: always()
+        run: |
+          echo "gold.retrieval_metrics — Recall@k, MRR, NDCG per slice."
+          echo "Task 07_serving_check  — whether an endpoint was created."
+          echo "Tasks 10 and 11        — real searches, and the dashboard."

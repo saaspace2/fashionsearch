@@ -684,18 +684,24 @@ def main():
     }
     print("\n" + json.dumps(manifest, indent=2))
 
-    # Register to Unity Catalog from here. This is what makes Model Serving
-    # possible — see connect_mlflow() for why registering from Kaggle succeeds
-    # where registering from a Databricks notebook is refused.
-    if connect_mlflow(args.catalog):
-        try:
-            name, version = register_encoder(encoder, processor, config, args, manifest)
-            manifest["registered_model"] = name
-            manifest["registered_version"] = int(version)
-        except Exception as exc:
-            print(f"\nregistration failed: {type(exc).__name__}: {exc}")
-            print("Embeddings are still uploaded below, so the pipeline can run "
-                  "without a registered model — only Model Serving needs one.")
+    # Save the encoder as weights plus config, for GitHub Actions to register.
+    #
+    # Kaggle deliberately holds NO Databricks credentials. Publishing them here
+    # needs a private Kaggle Dataset, and dataset writes are refused (403) on
+    # accounts without phone verification. Kaggle Secrets work but are stripped
+    # on every CLI push, so they would need re-ticking by hand after each one —
+    # which defeats the point of a pipeline.
+    #
+    # So Kaggle does pure compute and writes to its kernel output. GitHub
+    # downloads that and talks to Databricks itself. A GitHub runner is just as
+    # much "outside Databricks" as this kernel is, so Unity Catalog registration
+    # still succeeds where it fails from inside a Databricks notebook.
+    art_dir = os.path.join(out_dir, "encoder_artifact")
+    os.makedirs(art_dir, exist_ok=True)
+    config.save_pretrained(art_dir)
+    processor.save_pretrained(art_dir)
+    torch.save(encoder.state_dict(), os.path.join(art_dir, "state_dict.pt"))
+    print(f"encoder artifacts written to {art_dir}: {sorted(os.listdir(art_dir))}")
 
     paths = []
     for name, df in [("products", products), ("queries", queries)]:
@@ -708,15 +714,21 @@ def main():
         json.dump(manifest, fh, indent=2)
     paths.append((local_manifest, f"manifest_{stamp}.json"))
 
+    # If credentials happen to be available (Kaggle Secrets, or a run started by
+    # hand), upload directly — it saves GitHub a download. Otherwise everything
+    # is in the kernel output and GitHub collects it. Either path works.
     try:
         for local, remote in paths:
             push_to_databricks(local, args.catalog, remote)
-        print("\nUploads complete.")
-        trigger_github(manifest)
-    except SystemExit as exc:
-        print(f"\n{exc}")
-        print("Files were written locally and are in the kernel output, so the "
-              "GPU work is not lost. Attach the secrets and re-run to upload.")
+        print("\nUploaded directly to Databricks.")
+    except SystemExit:
+        print("\nNo Databricks credentials here — that is the normal path.")
+        print("Everything is in the kernel output; GitHub Actions collects it,")
+        print("uploads the embeddings and registers the encoder.")
+
+    print("\nOutputs written:")
+    for f in sorted(os.listdir(out_dir)):
+        print(f"  {f}")
 
 
 if __name__ == "__main__":
