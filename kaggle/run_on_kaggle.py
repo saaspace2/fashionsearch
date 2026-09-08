@@ -712,7 +712,15 @@ def main():
     config.save_pretrained(art_dir)
     processor.save_pretrained(art_dir)
     torch.save(encoder.state_dict(), os.path.join(art_dir, "state_dict.pt"))
-    print(f"encoder artifacts written to {art_dir}: {sorted(os.listdir(art_dir))}")
+    print(f"encoder artifacts -> {art_dir}: {sorted(os.listdir(art_dir))}")
+
+    # The detector too. It is served alongside the encoder as one model, and
+    # registered separately so it keeps its own version history.
+    det_dir = os.path.join(out_dir, "detector_artifact")
+    os.makedirs(det_dir, exist_ok=True)
+    detector.save_pretrained(det_dir)
+    det_processor.save_pretrained(det_dir)
+    print(f"detector artifacts -> {det_dir}: {sorted(os.listdir(det_dir))}")
 
     paths = []
     for name, df in [("products", products), ("queries", queries)]:

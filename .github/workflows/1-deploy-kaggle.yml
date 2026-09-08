@@ -163,16 +163,48 @@ jobs:
             databricks fs cp "$f" "${VOL}/$(basename "$f")" --overwrite
           done
 
-      - name: Register the encoder in Unity Catalog
+      - name: Register the models in Unity Catalog
         # From here, not from a Databricks notebook — see the header.
+        #
+        # Three registrations. The detector and encoder keep separate version
+        # histories, which is what the gate and lineage need. The combined
+        # search model pins one of each and is what the endpoint serves, so a
+        # client sends a photo instead of orchestrating two calls and doing the
+        # cropping itself.
         run: |
           set -e
-          pip install --quiet mlflow torch torchvision transformers pillow databricks-sdk
-          ART=$(find /tmp/out -type d -name encoder_artifact | head -1)
+          pip install --quiet mlflow torch torchvision transformers timm pillow databricks-sdk
+
+          ENC=$(find /tmp/out -type d -name encoder_artifact | head -1)
+          DET=$(find /tmp/out -type d -name detector_artifact | head -1)
           MAN=$(find /tmp/out -name 'manifest_*.json' | head -1)
-          MODEL=$(python -c "import yaml;print(yaml.safe_load(open('config.yaml'))['registry']['encoder_model'])")
+          test -n "$ENC" || { echo "::error::no encoder_artifact in the output"; exit 1; }
+          test -n "$DET" || { echo "::error::no detector_artifact in the output"; exit 1; }
+
+          eval $(python - <<'PY'
+          import yaml
+          r = yaml.safe_load(open("config.yaml"))["registry"]
+          print(f"ENC_MODEL={r['encoder_model']}")
+          print(f"DET_MODEL={r['detector_model']}")
+          print(f"SEARCH_MODEL={r['search_model']}")
+          PY
+          )
+
+          echo "--- encoder ---"
           python scripts/register_encoder.py \
-            --artifact-dir "$ART" --manifest "$MAN" --model-name "$MODEL"
+            --artifact-dir "$ENC" --manifest "$MAN" --model-name "$ENC_MODEL"
+
+          echo "--- detector ---"
+          python scripts/register_detector.py \
+            --artifact-dir "$DET" --manifest "$MAN" --model-name "$DET_MODEL"
+
+          echo "--- combined search model ---"
+          ENC_V=$(python -c "import json;print(json.load(open('registered.json'))['version'])")
+          DET_V=$(python -c "import json;print(json.load(open('registered_detector.json'))['version'])")
+          python scripts/register_search_model.py \
+            --detector-dir "$DET" --encoder-dir "$ENC" --manifest "$MAN" \
+            --model-name "$SEARCH_MODEL" \
+            --detector-version "$DET_V" --encoder-version "$ENC_V"
 
       - name: Run the Databricks pipeline
         # Already deployed above.

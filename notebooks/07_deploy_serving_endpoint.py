@@ -74,6 +74,13 @@ from pyspark.sql import functions as F
 dbutils.widgets.dropdown("alias", "production", ["candidate", "shadow", "production"])
 ALIAS = dbutils.widgets.get("alias")
 
+# The endpoint serves the COMBINED model: photo in, boxes plus embedding out.
+# Serving the encoder alone would mean the caller had to run detection and
+# cropping itself, and every caller would have to agree on which box to pick —
+# the moment two of them disagree, the embeddings stop being comparable.
+SERVED_MODEL = cfg.registry.get("search_model", cfg.registry.encoder_model)
+print(f"serving: {SERVED_MODEL}")
+
 # COMMAND ----------
 # MAGIC %md ## Can we deploy a real endpoint?
 
@@ -83,7 +90,7 @@ def serving_available() -> tuple:
     try:
         from mlflow.tracking import MlflowClient
         mlflow.set_registry_uri("databricks-uc")
-        MlflowClient().get_model_version_by_alias(cfg.registry.encoder_model, ALIAS)
+        MlflowClient().get_model_version_by_alias(SERVED_MODEL, ALIAS)
     except Exception as exc:
         return False, f"model not in Unity Catalog ({type(exc).__name__})"
 
@@ -106,7 +113,7 @@ if not CAN_SERVE:
 # MAGIC Runs in both modes. A model that fails here would fail behind an endpoint too.
 
 # COMMAND ----------
-uri = registry.resolve(cfg, cfg.registry.encoder_model, ALIAS)
+uri = registry.resolve(cfg, SERVED_MODEL, ALIAS)
 model = mlflow.pyfunc.load_model(uri)
 print(f"loaded {uri}")
 
@@ -195,10 +202,10 @@ if CAN_SERVE:
 
     w = WorkspaceClient()
     client = MlflowClient()
-    version = client.get_model_version_by_alias(cfg.registry.encoder_model, ALIAS)
+    version = client.get_model_version_by_alias(SERVED_MODEL, ALIAS)
 
     entities = [ServedEntityInput(
-        entity_name=cfg.registry.encoder_model,
+        entity_name=SERVED_MODEL,
         entity_version=version.version,
         name=f"encoder-v{version.version}",
         workload_size=cfg.serving.workload_size,
@@ -213,9 +220,9 @@ if CAN_SERVE:
     if traffic == 0:
         try:
             champ = client.get_model_version_by_alias(
-                cfg.registry.encoder_model, cfg.registry.aliases.champion)
+                SERVED_MODEL, cfg.registry.aliases.champion)
             entities.append(ServedEntityInput(
-                entity_name=cfg.registry.encoder_model,
+                entity_name=SERVED_MODEL,
                 entity_version=champ.version,
                 name=f"encoder-v{champ.version}",
                 workload_size=cfg.serving.workload_size,
@@ -241,7 +248,7 @@ else:
     print("and they are what would have caught a broken model anyway.")
 
 # COMMAND ----------
-row = [(cfg.registry.encoder_model, uri, ALIAS,
+row = [(SERVED_MODEL, uri, ALIAS,
         "endpoint" if CAN_SERVE else "local_validation",
         int(dim), bool(abs(norm - 1.0) < 1e-3),
         float(p50), float(p95), budget, bool(within),

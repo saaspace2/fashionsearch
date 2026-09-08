@@ -57,6 +57,12 @@ data:
 registry:
   detector_model: fashion_dev.ml.fashion_detector
   encoder_model:  fashion_dev.ml.fashion_encoder
+
+  # The deployable unit. Detector and encoder keep separate version histories
+  # for evaluation and lineage; this pins one of each and is what the serving
+  # endpoint actually runs, so a client sends a photo rather than orchestrating
+  # two calls and cropping in between.
+  search_model:   fashion_dev.ml.fashion_search
   aliases:
     candidate: candidate
     shadow: shadow
