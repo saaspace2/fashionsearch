@@ -1,0 +1,13 @@
+{
+  "id": "saahilpradhan/fashionsearch-gpu",
+  "title": "FashionSearch GPU",
+  "code_file": "run_on_kaggle.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}

@@ -1,0 +1,57 @@
+name: 2 · Pipeline — triggered by Kaggle
+
+# Runs when the Kaggle GPU job calls back, and not before.
+#
+# That ordering is the point. The pipeline evaluates embeddings and registers a
+# candidate, both of which need Kaggle to have finished first. Starting on a
+# timer would sometimes score the previous run's vectors, which is the kind of
+# bug that produces plausible numbers and no error.
+#
+# The callback is a repository_dispatch fired by kaggle/run_on_kaggle.py.
+# You can also start it by hand from the Actions tab.
+
+on:
+  repository_dispatch:
+    types: [kaggle-complete]
+  workflow_dispatch:
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  pipeline:
+    name: Ingest, evaluate, gate, serve
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: What Kaggle sent
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          echo "created_at         : ${{ github.event.client_payload.created_at }}"
+          echo "products embedded  : ${{ github.event.client_payload.n_products }}"
+          echo "eval queries       : ${{ github.event.client_payload.n_queries }}"
+          echo "registered model   : ${{ github.event.client_payload.registered_model }}"
+          echo "version            : ${{ github.event.client_payload.registered_version }}"
+          echo "fine-tuned         : ${{ github.event.client_payload.finetuned }}"
+
+      - name: Deploy the latest code
+        # Cheap, and guarantees the pipeline runs the same commit that produced
+        # the Kaggle output rather than whatever was deployed last.
+        run: databricks bundle deploy -t dev
+
+      - name: Run the pipeline
+        # 05b ingests Kaggle's embeddings, 06 gates, 07 deploys the endpoint if
+        # the model reached Unity Catalog, 10 and 11 report.
+        run: databricks bundle run fashion_pipeline -t dev
+
+      - name: Where to look
+        if: always()
+        run: |
+          echo "Catalog -> fashion_dev for tables and volumes."
+          echo "gold.retrieval_metrics — Recall@k, MRR, NDCG per slice."
+          echo "Task 07_serving_check  — whether an endpoint was created."
+          echo "Task 10 and 11         — real searches and the dashboard."

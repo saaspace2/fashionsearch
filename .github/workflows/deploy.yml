@@ -1,21 +1,24 @@
-name: deploy-to-databricks
+name: 1 · Setup — Databricks and Kaggle
 
-# What happens when:
+# ONE PUSH SETS EVERYTHING UP. It does not evaluate or deploy a model.
 #
-#   pull request  -> tests + validate only. Never touches Databricks.
-#   push to main  -> tests, validate, deploy, run setup, THEN run the full
-#                    pipeline (notebooks 00 to 06). End to end, no clicks.
-#   tag v*        -> deploy to prod (manual approval).
+#   validate    tests, lint, bundle validate
+#   databricks  deploy the bundle, create the catalog, schemas and volumes
+#   kaggle      publish credentials, push the GPU kernel
 #
-# The full pipeline takes 20-40 minutes: it downloads a 348 MB model and embeds
-# a few thousand images. The runner waits for it, so the Actions log tells you
-# whether it actually worked rather than just whether it started.
+# Pushing a kernel also starts it — the Kaggle CLI has no push-without-run — so
+# the GPU job begins here. When it finishes it calls back into GitHub and
+# workflow 2 takes over.
 #
-# ESCAPE HATCH: put [skip pipeline] anywhere in the commit message and the
-# pipeline step is skipped. Use it for README edits and typo fixes — otherwise
-# a one-character change costs you half an hour of runner time.
+#     push ──► setup (this) ──► Kaggle GPU run ──► repository_dispatch
+#                                                        │
+#                                                        ▼
+#                                          workflow 2 · pipeline
+#                                          evaluate, gate, serve
 #
-#   git commit -m "fix typo in README [skip pipeline]"
+# Required GitHub secrets:
+#   KAGGLE_USERNAME  KAGGLE_KEY  DATABRICKS_HOST  DATABRICKS_TOKEN
+#   GH_DISPATCH_TOKEN  (a PAT with 'repo' scope, so Kaggle can call back)
 
 on:
   push:
@@ -24,11 +27,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      run_full_pipeline:
-        description: 'Run the full pipeline (uncheck to only deploy)'
-        type: boolean
-        default: true
 
 env:
   DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -40,68 +38,121 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install test tools
-        # Kept in a file rather than inline so it cannot drift out of step with
-        # what the tests actually import.
-        run: pip install -r requirements-ci.txt
-
-      - name: Lint
-        # --exit-zero so style opinions never block a deploy. Real errors are
-        # caught by the tests below, which do block.
-        run: ruff check src/ --exit-zero
-
-      - name: Run tests
-        # Catches broken YAML, unparseable Python, job tasks pointing at files
-        # that do not exist, committed tokens, and gate-logic regressions.
-        run: pytest tests/ -v
-
+      - run: pip install -r requirements-ci.txt
+      - run: ruff check src/ --exit-zero
+      - run: pytest tests/ -v
       - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t dev
 
-      - name: Validate the bundle
-        run: databricks bundle validate -t dev
-
-  deploy-and-run:
-    name: Deploy and run the pipeline
+  databricks_setup:
+    name: Deploy bundle and create Unity Catalog
     needs: validate
     if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    timeout-minutes: 90        # the pipeline alone can take 40
     steps:
       - uses: actions/checkout@v4
       - uses: databricks/setup-cli@main
 
-      - name: Deploy
-        # Uploads the code and updates job definitions. Nothing executes yet.
+      - name: Deploy the bundle
+        # Uploads code and updates job definitions. Executes nothing.
         run: databricks bundle deploy -t dev
 
-      - name: Show what was deployed
-        run: databricks bundle summary -t dev
-
       - name: Create catalog, schemas and volumes
-        # Safe on every push: every statement is IF NOT EXISTS.
+        # Idempotent — every statement is IF NOT EXISTS.
         run: databricks bundle run fashion_setup -t dev
 
-      - name: Run the full pipeline
-        # Runs by default now. Skipped only when you ask: uncheck the box on a
-        # manual run, or put [skip pipeline] in the commit message.
-        if: >-
-          !contains(github.event.head_commit.message, '[skip pipeline]')
-          && (github.event_name != 'workflow_dispatch' || inputs.run_full_pipeline)
-        # No --params. sample_size comes from config.yaml, which is the single
-        # source of truth. Passing it here would override the file silently.
-        run: databricks bundle run fashion_pipeline -t dev
+      - run: databricks bundle summary -t dev
 
-      - name: Where to look next
-        if: always()
+  kaggle_setup:
+    name: Publish credentials and start the GPU run
+    needs: [validate, databricks_setup]
+    if: >-
+      github.event_name != 'pull_request'
+      && !startsWith(github.ref, 'refs/tags/')
+      && !contains(github.event.head_commit.message, '[skip kaggle]')
+    runs-on: ubuntu-latest
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --upgrade kaggle
+
+      - name: Publish credentials as a private Kaggle dataset
+        # Kaggle Secrets are UI-managed and stripped on every CLI push, so a
+        # kernel relying on them loses its credentials the moment this workflow
+        # runs. Dataset attachments live in kernel-metadata.json, which the
+        # kernel owns, and do survive.
+        #
+        # The dataset is private. Use a short-lived Databricks token.
         run: |
-          echo "Catalog -> fashion_dev for the tables and image volumes."
-          echo "gold.retrieval_metrics holds Recall@k / MRR / NDCG per slice."
-          echo "Run notebooks/09_try_a_search.py in the workspace to see real results."
+          set -e
+          mkdir -p /tmp/creds
+          cat > /tmp/creds/credentials.json <<JSON
+          {
+            "DATABRICKS_HOST": "${{ secrets.DATABRICKS_HOST }}",
+            "DATABRICKS_TOKEN": "${{ secrets.DATABRICKS_TOKEN }}",
+            "GH_DISPATCH_TOKEN": "${{ secrets.GH_DISPATCH_TOKEN }}",
+            "GH_REPO": "${{ github.repository }}"
+          }
+          JSON
+          cat > /tmp/creds/dataset-metadata.json <<JSON
+          {
+            "title": "fashionsearch credentials",
+            "id": "${KAGGLE_USERNAME}/fashionsearch-credentials",
+            "licenses": [{ "name": "CC0-1.0" }]
+          }
+          JSON
+
+          if kaggle datasets status "${KAGGLE_USERNAME}/fashionsearch-credentials" 2>&1 | grep -qi 'not found\|404'; then
+            kaggle datasets create -p /tmp/creds --dir-mode zip
+          else
+            kaggle datasets version -p /tmp/creds -m "rotate ${{ github.sha }}" --dir-mode zip
+          fi
+          sleep 20      # Kaggle needs a moment before the dataset is attachable
+
+      - name: Push the kernel — this also starts it on a T4
+        run: |
+          set -e
+          mkdir -p /tmp/kernel
+          cp kaggle/run_on_kaggle.py /tmp/kernel/
+
+          # Generated here so the username comes from the secret and nobody has
+          # to edit a committed file.
+          cat > /tmp/kernel/kernel-metadata.json <<JSON
+          {
+            "id": "${KAGGLE_USERNAME}/fashionsearch-gpu",
+            "title": "FashionSearch GPU",
+            "code_file": "run_on_kaggle.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true,
+            "dataset_sources": ["${KAGGLE_USERNAME}/fashionsearch-credentials"],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": []
+          }
+          JSON
+
+          kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4
+
+          echo ""
+          echo "=================================================================="
+          echo " The Kaggle kernel is running on a T4."
+          echo "   https://kaggle.com/code/${KAGGLE_USERNAME}/fashionsearch-gpu"
+          echo ""
+          echo " It embeds the catalogue, registers the encoder in Unity Catalog,"
+          echo " uploads the vectors, then calls back into GitHub."
+          echo " Workflow 2 takes over from there — nothing else to do."
+          echo "=================================================================="
 
   deploy-prod:
     name: Deploy to prod
@@ -109,11 +160,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
-      name: production      # add a required reviewer under Settings -> Environments
+      name: production
     steps:
       - uses: actions/checkout@v4
       - uses: databricks/setup-cli@main
-      # NOTE: the prod target grants permissions to groups named search-readers
-      # and search-engineers. Create them first or delete the permissions block
-      # from databricks.yml, or this step fails.
       - run: databricks bundle deploy -t prod

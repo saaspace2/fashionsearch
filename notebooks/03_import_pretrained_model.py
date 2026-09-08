@@ -34,6 +34,40 @@ from fashionsearch.compat import log_model
 cfg = load_config()
 
 import mlflow
+from fashionsearch import registry
+from pyspark.sql import functions as F
+
+dbutils.widgets.dropdown("force_reimport", "false", ["false", "true"],
+                         "Re-download and re-log even if a version exists")
+FORCE = dbutils.widgets.get("force_reimport") == "true"
+
+
+def existing_import(model_name: str, source_repo: str):
+    """
+    Find a registered version already imported from this exact checkpoint.
+
+    Re-importing an unchanged model downloads 348 MB, logs a new version and
+    inflates the registry for no benefit — the artifact is byte-identical. The
+    source repo is the right cache key: change hf_repo in config.yaml and this
+    correctly misses, which is what you want.
+    """
+    if FORCE:
+        return None
+    try:
+        uri = registry.resolve(cfg, model_name, cfg.registry.aliases.champion)
+        mlflow.pyfunc.load_model(uri)          # must actually be usable
+        run_id = uri.split("/")[1] if uri.startswith("runs:/") else None
+        if run_id:
+            params = mlflow.get_run(run_id).data.params
+            if params.get("source") != source_repo:
+                print(f"  champion came from {params.get('source')}, config now "
+                      f"asks for {source_repo} — re-importing")
+                return None
+        return uri
+    except Exception:
+        return None
+
+
 mlflow.set_registry_uri("databricks-uc")
 ensure_experiment(f"/Shared/{cfg.project.name}/import")
 
@@ -52,6 +86,12 @@ from transformers import AutoImageProcessor, SwinModel, SwinConfig
 from huggingface_hub import PyTorchModelHubMixin
 
 CKPT = cfg.pretrained.encoder.hf_repo
+
+reuse_encoder = existing_import(cfg.registry.encoder_model, CKPT)
+if reuse_encoder:
+    print(f"encoder already imported from {CKPT} and loads fine: {reuse_encoder}")
+    print("Skipping the 348 MB download. Set force_reimport to override.")
+
 encoder_config = SwinConfig.from_pretrained(CKPT)
 image_processor = AutoImageProcessor.from_pretrained(CKPT)
 
@@ -237,6 +277,10 @@ from transformers import AutoModelForObjectDetection
 
 DET_CKPT = cfg.pretrained.detector.hf_repo
 
+reuse_detector = existing_import(cfg.registry.detector_model, DET_CKPT)
+if reuse_detector:
+    print(f"detector already imported from {DET_CKPT}: {reuse_detector}")
+
 # Load explicitly rather than letting a failure here surface later as a
 # confusing NameError on a variable that was never assigned.
 try:
@@ -323,6 +367,9 @@ with mlflow.start_run(run_name="import-detector") as run:
     print("logged", detector_uri)
 
 # COMMAND ----------
-dbutils.jobs.taskValues.set("encoder_uri", encoder_uri)
-dbutils.jobs.taskValues.set("detector_uri", detector_uri)
+# Hand on whichever we ended up with — freshly logged, or the existing one.
+dbutils.jobs.taskValues.set("encoder_uri", reuse_encoder or encoder_uri)
+dbutils.jobs.taskValues.set("detector_uri", reuse_detector or detector_uri)
+print(f"\nencoder : {reuse_encoder or encoder_uri}")
+print(f"detector: {reuse_detector or detector_uri}")
 print("Next: 04_register_model")

@@ -49,6 +49,14 @@ encoder = mlflow.pyfunc.load_model(ENCODER)
 detector = mlflow.pyfunc.load_model(DETECTOR)
 print("both models loaded")
 
+# Serverless gives you several cores; torch does not always use them by default.
+try:
+    import torch, os
+    torch.set_num_threads(os.cpu_count() or 4)
+    print(f"torch threads: {torch.get_num_threads()}")
+except Exception as exc:
+    print(f"could not set thread count: {exc}")
+
 # COMMAND ----------
 # MAGIC %md ## Helpers
 
@@ -83,11 +91,39 @@ def progress(done, total, started, label):
 # MAGIC %md ## Embed the catalogue
 
 # COMMAND ----------
-products = (spark.table(table(cfg, "bronze", "products"))
-            .select("product_id", "image_path").toPandas())
+# The expensive part of this notebook is embedding, and most runs change
+# nothing about it. Re-embed only when the encoder version changed, or for
+# products that have never been embedded.
+#
+# ENCODER is a runs:/<run_id>/encoder URI, so it changes whenever notebook 03
+# logs a new model. Using it as the cache key means a new encoder correctly
+# invalidates every stored vector — which it must, since embeddings from two
+# different encoders are not comparable.
+all_products = spark.table(table(cfg, "bronze", "products")).select(
+    "product_id", "image_path")
+
+existing = None
+if spark.catalog.tableExists(table(cfg, "silver", "product_embeddings")):
+    existing = spark.table(table(cfg, "silver", "product_embeddings"))
+    if "encoder_uri" in existing.columns:
+        existing = existing.filter(F.col("encoder_uri") == ENCODER)
+    else:
+        existing = None      # written before we tracked this; treat as stale
+
+if existing is not None and existing.count():
+    todo = all_products.join(existing.select("product_id"), "product_id", "left_anti")
+    print(f"{existing.count()} products already embedded with this encoder")
+else:
+    todo = all_products
+    print("no reusable embeddings — encoder changed, or this is the first run")
+
+products = todo.toPandas()
 print(f"embedding {len(products)} products")
 
-BATCH = 16
+if len(products) == 0:
+    print("nothing to do — every product is already embedded with this encoder")
+
+BATCH = 48   # larger batches amortise the per-call overhead on CPU
 ids, vecs = [], []
 started = time.time()
 
@@ -110,17 +146,27 @@ for start in range(0, len(products), BATCH):
 print(f"embedded {len(ids)} products in {(time.time()-started)/60:.1f} min")
 
 # COMMAND ----------
-emb_df = spark.createDataFrame(
-    pd.DataFrame({"product_id": ids, "embedding": vecs}))
+if ids:
+    emb_df = spark.createDataFrame(
+        pd.DataFrame({"product_id": ids, "embedding": vecs}))
 
-(emb_df
- .join(spark.table(table(cfg, "bronze", "products"))
-       .select("product_id", "category", "in_stock", "region", "brand", "price"),
-       "product_id")
- .withColumn("embedded_at", F.current_timestamp())
- .withColumn("encoder_alias", F.lit(CHAMPION))
- .write.mode("overwrite").option("overwriteSchema", "true")
- .saveAsTable(table(cfg, "silver", "product_embeddings")))
+    new_rows = (emb_df
+        .join(spark.table(table(cfg, "bronze", "products"))
+              .select("product_id", "category", "in_stock", "region", "brand", "price"),
+              "product_id")
+        .withColumn("embedded_at", F.current_timestamp())
+        .withColumn("encoder_alias", F.lit(CHAMPION))
+        .withColumn("encoder_uri", F.lit(ENCODER)))
+
+    if existing is not None and existing.count():
+        # Add to what is already there.
+        new_rows.write.mode("append").saveAsTable(
+            table(cfg, "silver", "product_embeddings"))
+    else:
+        # Encoder changed: the old vectors are not comparable to the new ones,
+        # so replace rather than mix them.
+        new_rows.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+            table(cfg, "silver", "product_embeddings"))
 
 print("silver.product_embeddings:",
       spark.table(table(cfg, "silver", "product_embeddings")).count())
@@ -138,8 +184,22 @@ print("silver.product_embeddings:",
 # MAGIC than a flattering ideal.
 
 # COMMAND ----------
-queries = (spark.table(table(cfg, "gold", "eval_queries"))
-           .select("post_id", "query_image").toPandas())
+all_queries = spark.table(table(cfg, "gold", "eval_queries")).select(
+    "post_id", "query_image")
+
+q_existing = None
+if spark.catalog.tableExists(table(cfg, "silver", "query_embeddings")):
+    qe = spark.table(table(cfg, "silver", "query_embeddings"))
+    if "encoder_uri" in qe.columns:
+        q_existing = qe.filter(F.col("encoder_uri") == ENCODER)
+
+if q_existing is not None and q_existing.count():
+    q_todo = all_queries.join(q_existing.select("post_id"), "post_id", "left_anti")
+    print(f"{q_existing.count()} queries already processed with this encoder")
+else:
+    q_todo = all_queries
+
+queries = q_todo.toPandas()
 print(f"processing {len(queries)} eval queries")
 
 rows = []
@@ -185,9 +245,15 @@ Q_SCHEMA = T.StructType([
     T.StructField("occlusion", T.StringType()),
 ])
 
-(spark.createDataFrame(rows, schema=Q_SCHEMA)
- .write.mode("overwrite").option("overwriteSchema", "true")
- .saveAsTable(table(cfg, "silver", "query_embeddings")))
+if rows:
+    q_new = (spark.createDataFrame(rows, schema=Q_SCHEMA)
+             .withColumn("encoder_uri", F.lit(ENCODER)))
+    if q_existing is not None and q_existing.count():
+        q_new.write.mode("append").saveAsTable(
+            table(cfg, "silver", "query_embeddings"))
+    else:
+        q_new.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+            table(cfg, "silver", "query_embeddings"))
 
 # Fold the derived slice labels back into the frozen eval set.
 spark.sql(f"""

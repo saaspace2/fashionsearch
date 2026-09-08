@@ -31,6 +31,7 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path.cwd().parent / "src"))
 
 from fashionsearch.config import load_config, table
+from pyspark.sql import functions as F
 
 cfg = load_config()
 cat = cfg.catalog.name
@@ -43,6 +44,26 @@ print(f"Sampling {SAMPLE} items")
 # MAGIC %md ## Download the anchor–positive pairs
 
 # COMMAND ----------
+dbutils.widgets.dropdown("force_refresh", "false", ["false", "true"],
+                         "Re-download even if data is present")
+FORCE = dbutils.widgets.get("force_refresh") == "true"
+
+# Downloading 10,000 images takes minutes and produces the same rows every time.
+# Skip when the data is already there and matches what config asks for.
+already = 0
+if spark.catalog.tableExists(table(cfg, "bronze", "products")):
+    already = spark.table(table(cfg, "bronze", "products")).filter(
+        F.col("source") == cfg.data.pairs.hf_dataset).count()
+
+if already >= SAMPLE and not FORCE:
+    print(f"{already} products already ingested from {cfg.data.pairs.hf_dataset} "
+          f"(config asks for {SAMPLE}). Skipping the download.")
+    print("Set the force_refresh widget to true to re-ingest anyway.")
+    dbutils.notebook.exit("skipped — data already present")
+
+if already:
+    print(f"{already} products present but {SAMPLE} requested — re-ingesting.")
+
 import io, os, hashlib
 from datasets import load_dataset
 

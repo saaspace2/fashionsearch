@@ -16,8 +16,12 @@
 # MAGIC below is identical either way; only the transport differs.
 
 # COMMAND ----------
-# MAGIC %pip install -q torch torchvision transformers timm pillow
-# MAGIC %restart_python
+# MAGIC %md
+# MAGIC Dependencies come from the job's `environments:` block. If you open this
+# MAGIC notebook by hand instead, run this first:
+# MAGIC
+# MAGIC     %pip install -q torch torchvision transformers timm pillow
+# MAGIC     %restart_python
 
 # COMMAND ----------
 import sys, pathlib
