@@ -1,0 +1,107 @@
+name: 4 · Scheduled drift check and retrain
+
+# Everything else in this project triggers on git push. Data drift does not
+# announce itself with a commit — the catalogue turns over, photo styles shift,
+# and the model file is byte-identical while its real-world quality moves.
+#
+# So this runs every morning, asks the monitoring job whether anything has
+# moved, and if it has, re-pushes the Kaggle kernel. That starts a fresh GPU
+# run, which registers a new candidate, which calls back into workflow 3, which
+# evaluates it against the frozen eval set.
+#
+# The whole loop closes with no human in it — except the last step, where a
+# person still decides whether @candidate becomes @production.
+#
+# HOW IT DECIDES
+# Notebook 08 raises on a high-severity alert and exits cleanly otherwise, so
+# the job's own success or failure is the signal. That is deliberately simpler
+# than parsing run-output JSON, whose shape varies between CLI versions.
+#
+# The trade: a genuine bug in notebook 08 also looks like drift and triggers a
+# retrain. A wasted GPU run is a cheap failure, and the alert rows in
+# monitoring.alerts say which it was.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'      # 03:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      force_retrain:
+        description: 'Retrain even if no drift is detected'
+        type: boolean
+        default: false
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  check_drift:
+    name: Ask Databricks whether anything moved
+    runs-on: ubuntu-latest
+    outputs:
+      drift: ${{ steps.monitor.outputs.drift }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Run the monitoring job
+        id: monitor
+        run: |
+          set +e
+          databricks bundle run fashion_daily_monitor -t dev
+          CODE=$?
+          set -e
+          if [ $CODE -eq 0 ]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "No high-severity alerts. Nothing to do."
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Monitoring raised a high-severity alert — retraining."
+            echo "See fashion_dev.monitoring.alerts for which signal moved."
+          fi
+
+  retrain:
+    name: Start a fresh Kaggle run
+    needs: check_drift
+    if: needs.check_drift.outputs.drift == 'true' || inputs.force_retrain
+    runs-on: ubuntu-latest
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --upgrade kaggle
+
+      - name: Re-push the kernel, which re-runs it
+        run: |
+          set -e
+          mkdir -p /tmp/kernel
+          python kaggle/build_notebook.py /tmp/kernel/fashionsearch-gpu.ipynb
+          cat > /tmp/kernel/kernel-metadata.json <<JSON
+          {
+            "id": "${KAGGLE_USERNAME}/fashionsearch-gpu",
+            "title": "FashionSearch GPU",
+            "code_file": "fashionsearch-gpu.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true,
+            "dataset_sources": ["${KAGGLE_USERNAME}/fashionsearch-credentials"],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": []
+          }
+          JSON
+
+          OUT=$(kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4 2>&1) || true
+          echo "$OUT"
+          if echo "$OUT" | grep -qiE 'error|forbidden|403|404|authentication required'; then
+            echo "::error::Kernel push failed."
+            exit 1
+          fi
+          echo "Retrain started. It will call back into workflow 3 when done."

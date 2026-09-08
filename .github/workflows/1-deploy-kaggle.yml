@@ -1,0 +1,138 @@
+name: 1 · Deploy code to Kaggle
+
+# On every push: rebuild the notebook from kaggle/run_on_kaggle.py, refresh the
+# private credentials dataset, and push both to Kaggle.
+#
+# Pushing also STARTS the kernel — the Kaggle CLI has no push-without-run. The
+# GPU job therefore begins here, and when it finishes it calls back into GitHub
+# and workflow 3 takes over.
+#
+# Required GitHub secrets:
+#   KAGGLE_API_TOKEN    kaggle.com/settings/api -> Generate New Token
+#   KAGGLE_USERNAME     used to build the kernel id
+#   DATABRICKS_HOST     DATABRICKS_TOKEN     passed through to the kernel
+#   GH_DISPATCH_TOKEN   a PAT with 'repo' scope, so Kaggle can call back
+#
+# The CLI moved from the old KAGGLE_USERNAME + KAGGLE_KEY pair to a single
+# KAGGLE_API_TOKEN. The old pair now fails with
+# "Authentication required to call the Kaggle API".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'kaggle/**'
+      - 'src/**'
+      - 'config.yaml'
+  workflow_dispatch:
+
+jobs:
+  push_to_kaggle:
+    name: Push the notebook and start the GPU run
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip kaggle]')"
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install --upgrade kaggle
+
+      - name: Check Kaggle authentication first
+        # The CLI prints a long help message and exits non-zero when it cannot
+        # authenticate, which reads like a different problem entirely. Fail here
+        # with a message that names the fix.
+        run: |
+          if [ -z "$KAGGLE_API_TOKEN" ]; then
+            echo "::error::KAGGLE_API_TOKEN is not set."
+            echo "Get one at https://www.kaggle.com/settings/api -> Generate New Token."
+            exit 1
+          fi
+          if [ -z "$KAGGLE_USERNAME" ]; then
+            echo "::error::KAGGLE_USERNAME is not set — needed for the kernel id."
+            exit 1
+          fi
+          kaggle kernels list --mine --page-size 1 >/dev/null
+          echo "authenticated as ${KAGGLE_USERNAME}"
+
+      - name: Refresh the private credentials dataset
+        # Kaggle Secrets are UI-managed and stripped on every CLI push, so a
+        # kernel relying on them loses its credentials the moment this runs.
+        # Dataset attachments live in kernel-metadata.json, which the kernel
+        # owns, and do survive.
+        #
+        # The dataset is private. Use a short-lived Databricks token.
+        run: |
+          set -e
+          mkdir -p /tmp/creds
+          cat > /tmp/creds/credentials.json <<JSON
+          {
+            "DATABRICKS_HOST": "${{ secrets.DATABRICKS_HOST }}",
+            "DATABRICKS_TOKEN": "${{ secrets.DATABRICKS_TOKEN }}",
+            "GH_DISPATCH_TOKEN": "${{ secrets.GH_DISPATCH_TOKEN }}",
+            "GH_REPO": "${{ github.repository }}"
+          }
+          JSON
+          cat > /tmp/creds/dataset-metadata.json <<JSON
+          {
+            "title": "fashionsearch credentials",
+            "id": "${KAGGLE_USERNAME}/fashionsearch-credentials",
+            "licenses": [{ "name": "CC0-1.0" }]
+          }
+          JSON
+
+          if kaggle datasets status "${KAGGLE_USERNAME}/fashionsearch-credentials" 2>&1 | grep -qi 'not found\|404'; then
+            kaggle datasets create -p /tmp/creds --dir-mode zip
+          else
+            kaggle datasets version -p /tmp/creds -m "rotate ${{ github.sha }}" --dir-mode zip
+          fi
+          sleep 20      # Kaggle needs a moment before the dataset is attachable
+
+      - name: Build the notebook and push it
+        run: |
+          set -e
+          mkdir -p /tmp/kernel
+
+          # A real .ipynb, so what lands on Kaggle opens as a notebook you can
+          # read and re-run cell by cell. run_on_kaggle.py stays the source of
+          # truth — testable, diffable, editable in an editor.
+          python kaggle/build_notebook.py /tmp/kernel/fashionsearch-gpu.ipynb
+
+          cat > /tmp/kernel/kernel-metadata.json <<JSON
+          {
+            "id": "${KAGGLE_USERNAME}/fashionsearch-gpu",
+            "title": "FashionSearch GPU",
+            "code_file": "fashionsearch-gpu.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": true,
+            "enable_gpu": true,
+            "enable_internet": true,
+            "dataset_sources": ["${KAGGLE_USERNAME}/fashionsearch-credentials"],
+            "competition_sources": [],
+            "kernel_sources": [],
+            "model_sources": []
+          }
+          JSON
+
+          OUT=$(kaggle kernels push -p /tmp/kernel --accelerator NvidiaTeslaT4 2>&1) || true
+          echo "$OUT"
+          # The CLI sometimes prints an error and still exits zero, which would
+          # let this job go green having done nothing at all.
+          if echo "$OUT" | grep -qiE 'error|forbidden|403|404|not created|authentication required'; then
+            echo "::error::Kernel push failed — see output above."
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================================="
+          echo " Notebook pushed and running on a T4:"
+          echo "   https://kaggle.com/code/${KAGGLE_USERNAME}/fashionsearch-gpu"
+          echo ""
+          echo " It embeds the catalogue, registers the encoder in Unity Catalog,"
+          echo " uploads the vectors, then calls back into GitHub."
+          echo " Workflow 3 takes over from there."
+          echo "=================================================================="

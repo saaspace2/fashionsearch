@@ -1,0 +1,80 @@
+name: 2 · Deploy Databricks code + run SETUP
+
+# On every push: run the tests, deploy the bundle, and run the setup job so the
+# catalog, schemas and volumes exist BEFORE the Kaggle run needs them.
+#
+# That ordering matters. The Kaggle notebook uploads embeddings into
+# /Volumes/fashion_dev/silver/kaggle_inbox and registers a model into the
+# fashion_dev catalog. If neither exists yet, the Kaggle run fails at its last
+# step having already done all the GPU work.
+#
+# Setup is idempotent — every statement is CREATE ... IF NOT EXISTS — so running
+# it on every push is safe and takes about a minute. This workflow does NOT run
+# the evaluation pipeline; that is workflow 3, after Kaggle.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+
+jobs:
+  validate:
+    name: Test and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements-ci.txt
+      - name: Lint
+        # Advisory only. Style opinions should not block a deploy; real errors
+        # are caught by the tests below, which do block.
+        run: ruff check src/ --exit-zero
+      - name: Run tests
+        run: pytest tests/ -v
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t dev
+
+  deploy_and_setup:
+    name: Deploy bundle and create Unity Catalog
+    needs: validate
+    if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Deploy the bundle
+        # Uploads code and updates job definitions. Executes nothing.
+        run: databricks bundle deploy -t dev
+
+      - name: Create catalog, schemas and volumes
+        run: databricks bundle run fashion_setup -t dev
+
+      - run: databricks bundle summary -t dev
+
+      - name: What happens next
+        run: |
+          echo "Databricks is ready. Workflow 1 has pushed the Kaggle notebook,"
+          echo "which is running on a T4. When it finishes it calls back into"
+          echo "GitHub and workflow 3 runs the evaluation pipeline."
+
+  deploy_prod:
+    name: Deploy to prod
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle deploy -t prod
