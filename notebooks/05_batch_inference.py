@@ -41,12 +41,35 @@ from PIL import Image
 from pyspark.sql import functions as F, types as T
 
 CHAMPION = cfg.registry.aliases.champion
-ENCODER = registry.resolve(cfg, cfg.registry.encoder_model, CHAMPION)
-DETECTOR = registry.resolve(cfg, cfg.registry.detector_model, CHAMPION)
 
-# Load once, on the driver, into a writable location.
-encoder = mlflow.pyfunc.load_model(ENCODER)
-detector = mlflow.pyfunc.load_model(DETECTOR)
+# Work out whether there is anything to do BEFORE loading anything.
+#
+# When notebook 05b has already ingested Kaggle's embeddings there is no work
+# here, and loading two models to discover that wastes minutes — or fails
+# outright on a workspace that cannot read model artifacts from a notebook.
+_n_products = spark.table(table(cfg, "bronze", "products")).count()
+_n_embedded = (spark.table(table(cfg, "silver", "product_embeddings")).count()
+               if spark.catalog.tableExists(table(cfg, "silver", "product_embeddings"))
+               else 0)
+_n_queries = spark.table(table(cfg, "gold", "eval_queries")).count()
+_n_q_embedded = (spark.table(table(cfg, "silver", "query_embeddings")).count()
+                 if spark.catalog.tableExists(table(cfg, "silver", "query_embeddings"))
+                 else 0)
+
+print(f"products {_n_embedded}/{_n_products} embedded, "
+      f"queries {_n_q_embedded}/{_n_queries} embedded")
+
+if _n_embedded >= _n_products and _n_q_embedded >= _n_queries and _n_products:
+    dbutils.notebook.exit(
+        "nothing to embed — Kaggle already supplied everything (see notebook 05b)")
+
+# Only now, and via the loader that falls back to the volume when this
+# workspace cannot read registered model artifacts.
+from fashionsearch import local_models
+
+encoder = local_models.load(cfg, "encoder", CHAMPION)
+detector = local_models.load(cfg, "detector", CHAMPION)
+ENCODER = registry.resolve(cfg, cfg.registry.encoder_model, CHAMPION)
 print("both models loaded")
 
 # Serverless gives you several cores; torch does not always use them by default.

@@ -81,10 +81,9 @@ print(f"\nmode: {'HTTP endpoint' if USE_ENDPOINT else 'in-process fallback'}")
 # COMMAND ----------
 if not USE_ENDPOINT:
     ALIAS = cfg.registry.aliases.champion
-    _encoder = mlflow.pyfunc.load_model(
-        registry.resolve(cfg, cfg.registry.encoder_model, ALIAS))
-    _detector = mlflow.pyfunc.load_model(
-        registry.resolve(cfg, cfg.registry.detector_model, ALIAS))
+    from fashionsearch import local_models
+    _encoder = local_models.load(cfg, "encoder", ALIAS)
+    _detector = local_models.load(cfg, "detector", ALIAS)
 
 
 def b64_of(path):

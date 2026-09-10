@@ -99,10 +99,12 @@ mlflow.set_registry_uri("databricks-uc")
 ALIAS = cfg.registry.aliases.champion
 
 # Both models are pyfunc: image bytes in, a DataFrame out. No transformers here.
-encoder = mlflow.pyfunc.load_model(
-    registry.resolve(cfg, cfg.registry.encoder_model, ALIAS))
-detector = mlflow.pyfunc.load_model(
-    registry.resolve(cfg, cfg.registry.detector_model, ALIAS))
+# Registry first, volume second — this workspace cannot read model artifacts
+# from a notebook, so the volume copy is what actually gets used here.
+from fashionsearch import local_models
+
+encoder = local_models.load(cfg, "encoder", ALIAS)
+detector = local_models.load(cfg, "detector", ALIAS)
 
 
 def detect(image_path):
