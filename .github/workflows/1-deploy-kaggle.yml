@@ -21,15 +21,19 @@ name: 1 · Kaggle GPU run
 #
 # Secrets: KAGGLE_API_TOKEN  KAGGLE_USERNAME  DATABRICKS_HOST  DATABRICKS_TOKEN
 
+# No paths filter. This workflow is the entire pipeline — GPU run, model
+# registration and the Databricks jobs — so a change to any notebook has to be
+# able to trigger it. An earlier filter listed only kaggle/, src/ and
+# config.yaml, and a fix to notebooks/04 silently ran nothing at all.
 on:
   push:
     branches: [main]
-    paths:
-      - 'kaggle/**'
-      - 'src/**'
-      - 'scripts/**'
-      - 'config.yaml'
   workflow_dispatch:
+    inputs:
+      skip_kaggle:
+        description: 'Reuse existing embeddings, skip the GPU run'
+        type: boolean
+        default: false
 
 env:
   KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
@@ -39,10 +43,15 @@ env:
 
 jobs:
   gpu_run:
-    name: Run on Kaggle, then hand results to Databricks
+    name: Kaggle GPU run and model registration
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    if: "!contains(github.event.head_commit.message, '[skip kaggle]')"
+    # Skippable on its own. A notebook-only change does not need fresh
+    # embeddings — the ones already in the volume are still valid — so this
+    # skips while the pipeline below still runs.
+    if: >-
+      !contains(github.event.head_commit.message, '[skip kaggle]')
+      && (github.event_name != 'workflow_dispatch' || !inputs.skip_kaggle)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -208,8 +217,33 @@ jobs:
             --model-name "$SEARCH_MODEL" \
             --detector-version "$DET_V" --encoder-version "$ENC_V"
 
-      - name: Run the Databricks pipeline
-        # Already deployed above.
+  pipeline:
+    name: Run the Databricks pipeline
+    needs: gpu_run
+    # always(): the pipeline runs whether the GPU job succeeded, failed or was
+    # skipped. Skipped means "reuse existing embeddings", and failed still
+    # leaves the previous run's embeddings in place — either way there is work
+    # worth doing, and going dark on a Kaggle problem helps nobody.
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+
+      - name: Note what came before
+        run: |
+          echo "Kaggle job result: ${{ needs.gpu_run.result }}"
+          if [ "${{ needs.gpu_run.result }}" != "success" ]; then
+            echo "Running against whatever embeddings are already in the volume."
+          fi
+
+      - name: Deploy the latest code
+        # Cheap, and guarantees the pipeline runs this commit rather than
+        # whatever happened to be deployed last.
+        run: databricks bundle deploy -t dev
+
+      - name: Run the pipeline
         run: databricks bundle run fashion_pipeline -t dev
 
       - name: Where to look
