@@ -182,6 +182,14 @@ jobs:
           # Unity Catalog is still the registry: versions, aliases, lineage and
           # the gate's record all live there. This is a readable copy, not a
           # second registry.
+          # A few hundred real images, so notebooks 09 and 10 can show results.
+          # Not the whole catalogue — vectors for everything, pictures for a few.
+          SRC=$(find /tmp/out -type d -name sample_images | head -1)
+          if [ -n "$SRC" ]; then
+            echo "uploading sample_images/ ($(ls "$SRC" | wc -l) files)"
+            databricks fs cp -r "$SRC" "${VOL}/sample_images" --overwrite
+          fi
+
           for d in encoder_artifact detector_artifact; do
             SRC=$(find /tmp/out -type d -name "$d" | head -1)
             if [ -n "$SRC" ]; then

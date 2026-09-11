@@ -697,6 +697,33 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = "/kaggle/working" if on_kaggle() else "."
 
+    # Export a SAMPLE of the actual images.
+    #
+    # Databricks never sees the dataset — this kernel downloads it from Hugging
+    # Face and the images stay here. Notebooks 09 and 10 exist to let you LOOK
+    # at search results, and they cannot show a picture that is not there.
+    #
+    # A sample rather than all of them: 10,000 products is roughly a gigabyte
+    # to upload and store for no benefit. You need enough to eyeball, not the
+    # whole catalogue. Vectors for everything, pictures for a few hundred.
+    SAMPLE_IMAGES = 300
+    img_dir = os.path.join(out_dir, "sample_images")
+    os.makedirs(img_dir, exist_ok=True)
+
+    n_sample = min(SAMPLE_IMAGES, len(ds))
+    for i in range(n_sample):
+        pid = f"p{i:07d}"
+        try:
+            ds[i][positive_col].convert("RGB").save(
+                os.path.join(img_dir, f"{pid}.jpg"), quality=85)
+            if i < min(n_sample, n_eval):
+                ds[i][anchor_col].convert("RGB").save(
+                    os.path.join(img_dir, f"post_{pid}.jpg"), quality=85)
+        except Exception:
+            continue
+    print(f"sample images -> {img_dir}: {len(os.listdir(img_dir))} files "
+          f"(products and queries for the first {n_sample})")
+
     products = pd.DataFrame({
         "product_id": [f"p{i:07d}" for i in range(len(ds))],
         "category": [category_of(i) for i in range(len(ds))],

@@ -136,8 +136,23 @@ print("embeddings loaded")
 # MAGIC matches the vectors.
 
 # COMMAND ----------
+# Point at the real file when Kaggle shipped one, and at a marker otherwise.
+#
+# Only a few hundred images are uploaded, so most rows keep the marker. That is
+# fine for retrieval — it works on vectors — but notebooks that DISPLAY results
+# must filter to rows whose image actually exists, or they hit FileNotFoundError.
+IMAGES = f"{INBOX}/sample_images"
+have_images = os.path.isdir(IMAGES)
+available = set(os.listdir(IMAGES)) if have_images else set()
+print(f"sample images available: {len(available)}")
+
+_img = F.udf(lambda pid: (f"{IMAGES}/{pid}.jpg" if f"{pid}.jpg" in available
+                          else f"kaggle://{stamp}/{pid}"))
+_post = F.udf(lambda pid: (f"{IMAGES}/post_{pid}.jpg" if f"post_{pid}.jpg" in available
+                           else f"kaggle://{stamp}/post_{pid}"))
+
 (products.select("product_id", "category")
- .withColumn("image_path", F.concat(F.lit(f"kaggle://{stamp}/"), F.col("product_id")))
+ .withColumn("image_path", _img(F.col("product_id")))
  .withColumn("in_stock", F.lit(True))
  .withColumn("region", F.lit("KR"))
  .withColumn("brand", F.lit(None).cast("string"))
@@ -152,7 +167,7 @@ print("embeddings loaded")
  .saveAsTable(table(cfg, "bronze", "products")))
 
 (queries
- .withColumn("query_image", F.concat(F.lit(f"kaggle://{stamp}/"), F.col("post_id")))
+ .withColumn("query_image", _post(F.col("product_id")))
  .withColumn("relevant_ids", F.array(F.col("product_id")))
  .withColumn("relevance_map", F.map_from_arrays(
      F.array(F.col("product_id")), F.array(F.lit(1.0))))
@@ -164,6 +179,12 @@ print("embeddings loaded")
  .saveAsTable(table(cfg, "gold", "eval_queries")))
 
 print("bronze.products and gold.eval_queries rebuilt from the Kaggle run")
+
+n_viewable = spark.sql(f"""
+    SELECT count(*) AS n FROM {table(cfg, "gold", "eval_queries")}
+    WHERE query_image NOT LIKE 'kaggle://%'
+""").first()["n"]
+print(f"{n_viewable} eval queries have a real image — notebooks 09 and 10 use these")
 
 # COMMAND ----------
 # MAGIC %md ## 5 · Slice coverage, before the gate spends a run finding out

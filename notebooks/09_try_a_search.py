@@ -72,7 +72,11 @@ paths = dict(zip(cat_df.product_id, cat_df.image_path))
 
 print(f"catalogue: {len(cat_df)} products across {len(set(cats))} categories")
 
-queries = spark.table(table(cfg, "gold", "eval_queries"))
+# Only rows with a real image on disk. Most rows carry a kaggle://
+# marker because Kaggle ships a sample of pictures, not all 10,000 —
+# opening a marker raises FileNotFoundError.
+queries = spark.table(table(cfg, "gold", "eval_queries")).filter(
+    ~F.col("query_image").startswith("kaggle://"))
 if CATEGORY != "any":
     queries = queries.filter(F.col("category") == CATEGORY)
 q_pdf = queries.orderBy(F.rand(seed=7)).limit(N).toPandas()

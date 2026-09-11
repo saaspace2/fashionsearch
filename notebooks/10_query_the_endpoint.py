@@ -176,8 +176,16 @@ def search(image_path, top_k=TOP_K):
     }
 
 # COMMAND ----------
+# Only rows with a real image on disk. Most rows carry a kaggle://
+# marker because Kaggle ships a sample of pictures, not all 10,000 —
+# opening a marker raises FileNotFoundError.
 queries = (spark.table(table(cfg, "gold", "eval_queries"))
+           .filter(~F.col("query_image").startswith("kaggle://"))
            .orderBy(F.rand(seed=11)).limit(N).toPandas())
+if queries.empty:
+    dbutils.notebook.exit(
+        "no eval queries have a viewable image yet — re-run the Kaggle job so "
+        "it uploads sample_images/, then run this again")
 
 def thumb(path, size=110):
     try:
