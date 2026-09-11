@@ -124,23 +124,8 @@ resources:
           notebook_task:
             notebook_path: ../notebooks/08_monitor_and_reassess.py
 
-        # Everything below is reporting, not gating. run_if: ALL_DONE so it
-        # still runs when the gate blocks — a blocked candidate is exactly when
-        # you want to look at the numbers.
-        - task_key: "10_query_the_endpoint"
-          depends_on: [{ task_key: "08_monitor_and_reassess" }]
-          run_if: ALL_DONE
-          max_retries: 1
-          min_retry_interval_millis: 60000
-          environment_key: torch
-          notebook_task:
-            notebook_path: ../notebooks/10_query_the_endpoint.py
-            base_parameters:
-              n_queries: "5"
-              top_k: "8"
-
         - task_key: "11_dashboard"
-          depends_on: [{ task_key: "10_query_the_endpoint" }]
+          depends_on: [{ task_key: "08_monitor_and_reassess" }]
           run_if: ALL_DONE
           max_retries: 1
           min_retry_interval_millis: 60000
