@@ -240,11 +240,24 @@ if CAN_SERVE:
     endpoint_name = cfg.serving.endpoint_name
 
     if endpoint_name in [e.name for e in w.serving_endpoints.list()]:
-        w.serving_endpoints.update_config_and_wait(name=endpoint_name, **config.as_dict())
+        # Pass the typed objects, NOT **config.as_dict().
+        #
+        # as_dict() flattens the nested ServedEntityInput and TrafficConfig
+        # objects into plain dicts. Splatting those back in hands the SDK dicts
+        # where it expects typed objects, and it then calls .as_dict() on them:
+        #
+        #     AttributeError: 'dict' object has no attribute 'as_dict'
+        w.serving_endpoints.update_config_and_wait(
+            name=endpoint_name,
+            served_entities=entities,
+            traffic_config=TrafficConfig(routes=routes))
         print(f"updated endpoint {endpoint_name}")
     else:
         w.serving_endpoints.create_and_wait(name=endpoint_name, config=config)
         print(f"created endpoint {endpoint_name}")
+
+    state = w.serving_endpoints.get(endpoint_name).state
+    print(f"endpoint state: {state}")
     note = f"deployed at {traffic}% traffic"
     reason = note
   except Exception as exc:
