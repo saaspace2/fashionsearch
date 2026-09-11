@@ -144,45 +144,80 @@ class VolumeDetector:
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
-def load(cfg, which: str, alias: str | None = None):
-    """
-    Get a usable model, registry first, volume second.
+def _from_volume(cfg, which: str):
+    directory = artifact_dir(cfg, which)
+    if not os.path.isdir(directory):
+        return None, f"{directory} does not exist"
+    try:
+        model = (VolumeEncoder(directory) if which == "encoder"
+                 else VolumeDetector(directory))
+        print(f"  loaded {which} from the volume: {directory}")
+        return model, None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
 
-    The registry is tried first so that a workspace where models:/ works keeps
-    full lineage on every load. The volume is the fallback for the tier that
-    cannot fetch registered artifacts.
 
-    Raises with both failures named if neither route works — otherwise you get
-    a bare 400 and no indication that a second route was even attempted.
-    """
+def _from_registry(cfg, which: str, alias: str):
     import mlflow
-
     from fashionsearch import registry
 
-    alias = alias or cfg.registry.aliases.champion
     model_name = (cfg.registry.encoder_model if which == "encoder"
                   else cfg.registry.detector_model)
-
-    registry_error = None
     try:
         uri = registry.resolve(cfg, model_name, alias)
         model = mlflow.pyfunc.load_model(uri)
         print(f"  loaded {which} from the registry: {uri}")
+        return model, None
+    except BaseException as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+def load(cfg, which: str, alias: str | None = None):
+    """
+    Get a usable model.
+
+    Route chosen by registry.load_from in config.yaml. Under "auto" the volume
+    copy wins when it exists, because on this workspace the registry route
+    cannot work — the cluster's assumed role is denied on model-artifact
+    storage. Trying it first on every load produced a long HeadObject 400
+    traceback before falling back anyway, which buried the real output.
+
+    Both routes serve the same model. GitHub Actions registers to Unity Catalog
+    and uploads the raw files to the volume in the same step, from the same
+    artifacts, so they cannot diverge.
+
+    Unity Catalog is still the registry. Versions, aliases, lineage and the
+    gate's record all live there. This only decides how bytes are read.
+    """
+    alias = alias or cfg.registry.aliases.champion
+    preference = str(cfg.registry.get("load_from", "auto")).lower()
+
+    if preference == "registry":
+        model, err = _from_registry(cfg, which, alias)
+        if model:
+            return model
+        raise SystemExit(f"Cannot load the {which} from the registry: {err}")
+
+    if preference == "volume":
+        model, err = _from_volume(cfg, which)
+        if model:
+            return model
+        raise SystemExit(f"Cannot load the {which} from the volume: {err}")
+
+    # auto
+    model, volume_error = _from_volume(cfg, which)
+    if model:
         return model
-    except Exception as exc:
-        registry_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-        print(f"  registry load failed for {which} — falling back to the volume")
 
-    directory = artifact_dir(cfg, which)
-    if not os.path.isdir(directory):
-        raise SystemExit(
-            f"Cannot load the {which}.\n\n"
-            f"  registry: {registry_error}\n"
-            f"  volume  : {directory} does not exist\n\n"
-            f"GitHub Actions uploads the model files there after each Kaggle "
-            f"run. If the directory is missing, that step has not run yet on "
-            f"this workspace — push to trigger it.")
+    print(f"  no volume copy of the {which} ({volume_error}) — trying the registry")
+    model, registry_error = _from_registry(cfg, which, alias)
+    if model:
+        return model
 
-    model = VolumeEncoder(directory) if which == "encoder" else VolumeDetector(directory)
-    print(f"  loaded {which} from the volume: {directory}")
-    return model
+    raise SystemExit(
+        f"Cannot load the {which} by either route.\n\n"
+        f"  volume  : {volume_error}\n"
+        f"  registry: {registry_error}\n\n"
+        f"GitHub Actions uploads the model files to the volume after each "
+        f"Kaggle run. A missing directory means that step has not run yet — "
+        f"push to trigger it.")

@@ -147,7 +147,18 @@ if sample:
     except Exception as exc:
         print(f"could not read a sample image: {exc}")
 
-if uri and payload is not None:
+# Skip the local load entirely when config says the registry is unreadable
+# here. The serving container loads the model itself, so this check is a
+# nice-to-have — and attempting it produces a 300-line traceback that buries
+# the endpoint result underneath it.
+SKIP_LOCAL = str(cfg.registry.get("load_from", "auto")).lower() != "registry"
+
+if SKIP_LOCAL:
+    print("skipping the local contract check — registry.load_from is not "
+          "'registry', so this workspace is not expected to read model "
+          "artifacts from a notebook. The serving container loads the model.")
+    load_error = "skipped by config"
+elif uri and payload is not None:
     try:
         model = mlflow.pyfunc.load_model(uri)
         print("model loaded locally")

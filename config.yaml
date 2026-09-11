@@ -63,6 +63,21 @@ registry:
   # endpoint actually runs, so a client sends a photo rather than orchestrating
   # two calls and cropping in between.
   search_model:   fashion_dev.ml.fashion_search
+
+  # How notebooks load a model. This does NOT change where models are
+  # registered — Unity Catalog remains the registry, with versions, aliases and
+  # lineage. It only chooses the read route.
+  #
+  #   auto      volume copy if present, registry otherwise  (default)
+  #   registry  always models:/...
+  #   volume    always the volume copy
+  #
+  # "auto" defaults to the volume because this workspace tier cannot read model
+  # artifacts from a notebook — the cluster's assumed role is denied on that
+  # storage, the same denial that blocked registering from inside Databricks.
+  # Trying the registry first on every load just produces a long HeadObject 400
+  # traceback before falling back anyway.
+  load_from: auto
   aliases:
     candidate: candidate
     shadow: shadow
