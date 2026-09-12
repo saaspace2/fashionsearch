@@ -1,0 +1,5 @@
+streamlit>=1.40
+databricks-sdk>=0.38
+pandas>=2.0
+numpy>=1.24
+pillow>=10.0

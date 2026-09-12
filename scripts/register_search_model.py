@@ -121,8 +121,25 @@ def build_wrapper(mlflow, score_threshold):
             self.threshold = score_threshold
 
         def predict(self, context, model_input, params=None):
+            """
+            One row per DETECTED GARMENT, not one row per image.
+
+            An outfit photo contains several things a user might be searching
+            for. Returning only the largest, most confident one — which an
+            earlier version did — means someone who photographed a full outfit
+            can search for the jacket but never the trousers.
+
+            So every box above the threshold gets its own crop, its own
+            embedding and its own row, tagged with which input image it came
+            from. The caller decides which to act on; the model does not decide
+            for them.
+
+            When nothing is detected at all, one row is returned for the whole
+            image. That keeps the contract stable — there is always at least one
+            row per input — and matches what the evaluation set measures.
+            """
             rows = []
-            for b64 in model_input["image"]:
+            for idx, b64 in enumerate(model_input["image"]):
                 img = self.Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
                 W, H = img.size
 
@@ -133,37 +150,47 @@ def build_wrapper(mlflow, score_threshold):
                     out, threshold=self.threshold,
                     target_sizes=self.torch.tensor([[H, W]]))[0]
 
-                if len(res["boxes"]):
-                    # Biggest confident thing wins — the item the photo is
-                    # about, not a shoe in the corner. This rule lives inside
-                    # the model so every caller applies it identically.
-                    areas = [((b[2]-b[0])*(b[3]-b[1])).item()/(W*H)
-                             for b in res["boxes"]]
-                    best = max(range(len(areas)),
-                               key=lambda j: areas[j] * res["scores"][j].item())
-                    x1, y1, x2, y2 = [float(v) for v in res["boxes"][best]]
-                    crop = img.crop((x1, y1, x2, y2))
-                    category = self.id2label[int(res["labels"][best])]
-                    score = float(res["scores"][best])
-                    area = areas[best]
-                    fell_back = False
-                else:
+                found = []
+                for score, label, box in zip(res["scores"], res["labels"], res["boxes"]):
+                    x1, y1, x2, y2 = [float(v) for v in box]
+                    area = ((x2 - x1) * (y2 - y1)) / (W * H)
+                    found.append({
+                        "category": self.id2label[int(label)],
+                        "score": float(score),
+                        "area": area,
+                        "crop": img.crop((x1, y1, x2, y2)),
+                        "box": [x1, y1, x2, y2],
+                    })
+
+                if not found:
                     # Screenshots, flat-lays and tight crops defeat detection
                     # routinely. A worse answer beats no answer, and the eval
                     # set goes through this same path so the numbers are honest.
-                    crop, category, score, area, fell_back = img, None, 0.0, 1.0, True
+                    found = [{"category": None, "score": 0.0, "area": 1.0,
+                              "crop": img, "box": [0.0, 0.0, float(W), float(H)]}]
+                    fell_back = True
+                else:
+                    fell_back = False
+                    # Biggest and most confident first, so a caller that only
+                    # wants one gets the same answer as before.
+                    found.sort(key=lambda f: f["area"] * f["score"], reverse=True)
 
-                tensor = self.tf(crop).unsqueeze(0)
+                tensors = [self.tf(f["crop"]) for f in found]
                 with self.torch.no_grad():
-                    emb = self.enc(tensor).cpu().numpy()[0]
+                    embeddings = self.enc(self.torch.stack(tensors)).cpu().numpy()
 
-                rows.append({
-                    "detected_category": category,
-                    "detector_score": score,
-                    "area_frac": area,
-                    "used_whole_image": fell_back,
-                    "embedding": emb.tolist(),
-                })
+                for rank, (f, emb) in enumerate(zip(found, embeddings)):
+                    rows.append({
+                        "row": idx,
+                        "item_index": rank,
+                        "detected_category": f["category"],
+                        "detector_score": f["score"],
+                        "area_frac": f["area"],
+                        "x1": f["box"][0], "y1": f["box"][1],
+                        "x2": f["box"][2], "y2": f["box"][3],
+                        "used_whole_image": fell_back,
+                        "embedding": emb.tolist(),
+                    })
             return pd.DataFrame(rows)
 
     return SearchModel
@@ -203,7 +230,9 @@ def main():
     example = pd.DataFrame({"image": [base64.b64encode(buf.getvalue()).decode()]})
     dim = int(manifest.get("embedding_dim", 128))
     out_example = pd.DataFrame([{
-        "detected_category": "outer", "detector_score": 0.9, "area_frac": 0.3,
+        "row": 0, "item_index": 0, "detected_category": "outer",
+        "detector_score": 0.9, "area_frac": 0.3,
+        "x1": 0.0, "y1": 0.0, "x2": 1.0, "y2": 1.0,
         "used_whole_image": False, "embedding": [0.0] * dim}])
 
     with mlflow.start_run(run_name=f"search-{manifest.get('created_at','')}") as run:
@@ -249,6 +278,8 @@ def main():
     reloaded = mlflow.pyfunc.load_model(f"models:/{args.model_name}/{result.version}")
     out = reloaded.predict(example)
     assert "embedding" in out.columns, "no embedding column"
+    assert "item_index" in out.columns, "no item_index — multi-item output missing"
+    assert len(out) >= 1, "a model must return at least one row per image"
     assert len(out["embedding"].iloc[0]) == dim, "wrong embedding size"
     norm = float(np.linalg.norm(np.asarray(out["embedding"].iloc[0], dtype=np.float32)))
     assert abs(norm - 1.0) < 1e-2, f"embedding is not unit length: {norm}"

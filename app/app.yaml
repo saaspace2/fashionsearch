@@ -1,0 +1,13 @@
+# Databricks Apps entry point.
+command: ["streamlit", "run", "app/app.py", "--server.port", "8080",
+          "--server.address", "0.0.0.0"]
+
+env:
+  - name: CATALOG
+    value: fashion_dev
+  - name: ENDPOINT
+    value: fashion-encoder-endpoint
+  # Set this to your SQL warehouse ID — Databricks -> SQL Warehouses -> the ID
+  # appears in the connection details and in the URL after /warehouses/.
+  - name: WAREHOUSE_ID
+    value: ""
