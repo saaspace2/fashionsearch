@@ -119,5 +119,17 @@ serving:
 monitoring:
   min_ctr: 0.18
   max_zero_result_rate: 0.04
-  max_index_staleness_hours: 6
+  # How old embeddings may get before it is worth saying something.
+  #
+  # Six hours is the right number for a live shop, where the catalogue turns
+  # over constantly and a stale index means returning products that are sold
+  # out. It is the wrong number here: embeddings refresh when the Kaggle job
+  # runs, which happens on a push, and days between pushes is normal.
+  #
+  # At six hours this fired on ordinary development rhythm — an alert that
+  # cries wolf teaches you to ignore the channel it arrives on, which costs
+  # more than the thing it was warning about.
+  #
+  # A week for development. Drop it back to 6 when this serves real users.
+  max_index_staleness_hours: 168
   drift_threshold: 0.15

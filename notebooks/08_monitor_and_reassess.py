@@ -79,8 +79,14 @@ if fresh and fresh["hours"] is not None:
     print(f"  last embedded : {fresh['last_embedded']}")
     print(f"  age           : {fresh['hours']} h  (limit {max_hours:.0f} h)")
     if fresh["hours"] > max_hours:
-        alert("index_stale", "high", float(fresh["hours"]),
-              "search may be returning products that no longer exist")
+        # Graded rather than binary. Slightly over the limit is worth noting;
+        # four times over means the pipeline has genuinely stopped running, and
+        # only that deserves to fail the job and wake somebody.
+        severity = "high" if fresh["hours"] > max_hours * 4 else "warning"
+        alert("index_stale", severity, float(fresh["hours"]),
+              f"embeddings are {fresh['hours']:.0f}h old (limit {max_hours:.0f}h). "
+              f"Search may be returning products that no longer exist. "
+              f"Re-run the pipeline to refresh them.")
 else:
     alert("no_index", "high", 0.0, "no embeddings at all — run notebook 05")
 
