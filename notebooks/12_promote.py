@@ -59,11 +59,33 @@ print(f"model: {MODEL}")
 
 # COMMAND ----------
 versions = client.search_model_versions(f"name='{MODEL}'")
+
+
+def alias_text(v) -> str:
+    """
+    Aliases, as a readable string.
+
+    The shape of ModelVersion.aliases varies: a list of strings on some MLflow
+    versions, a list of objects with .alias on others, absent entirely on a few.
+    Joining it blindly gives "TypeError: can only join an iterable", which says
+    nothing useful about which of those happened.
+    """
+    raw = getattr(v, "aliases", None)
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    try:
+        return ", ".join(getattr(a, "alias", None) or str(a) for a in raw)
+    except TypeError:
+        return str(raw)
+
+
 rows = []
 for v in sorted(versions, key=lambda x: int(x.version), reverse=True):
     tags = v.tags or {}
     rows.append((int(v.version),
-                 ", ".join(v.aliases) if v.aliases else "",
+                 alias_text(v),
                  tags.get("gate_status", ""),
                  tags.get("detector_version", ""),
                  tags.get("encoder_version", ""),
