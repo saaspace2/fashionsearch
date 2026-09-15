@@ -152,6 +152,109 @@ def endpoint_state() -> tuple:
         return ENDPOINT, None
 
 
+# ------------------------------------------------------------------ logging
+
+def _sql_str(value) -> str:
+    """Quote a value for SQL, or NULL. Single quotes doubled to escape them."""
+    if value is None:
+        return "NULL"
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _sql_array(values) -> str:
+    if not values:
+        return "array()"
+    return "array(" + ", ".join(_sql_str(v) for v in values) + ")"
+
+
+def log_search_event(image_bytes: bytes, items: list, latency_ms: float,
+                     session_id: str, model_version: str = "") -> str | None:
+    """
+    Record one search: the photo, what was detected, and what was returned.
+
+    WHY THIS MATTERS MORE THAN IT LOOKS
+    -----------------------------------
+    Every query somebody runs here is a free example of what production
+    actually looks like. The evaluation set is built from dataset anchors —
+    pre-cropped single garments, 976 of 1000 of them 'large'. Real uploads are
+    full-outfit photos where a jacket fills 15% of the frame.
+
+    Those are precisely the queries the eval set lacks, and until now the app
+    discarded them the moment the next photo was uploaded.
+
+    Returns the event_id so a later click can be attached to it, or None if
+    logging is not configured — a failure here must never break a search.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    if not WAREHOUSE_ID:
+        return None
+
+    event_id = uuid.uuid4().hex
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    remote = f"/Volumes/{CATALOG}/raw/query_images/live/{stamp}/{event_id}.jpg"
+
+    try:
+        w = workspace()
+        w.files.upload(remote, io.BytesIO(image_bytes), overwrite=True)
+    except Exception as exc:
+        print(f"could not store the query image: {exc}")
+        remote = None
+
+    first = items[0] if items else {}
+    results = []
+    for item in items:
+        hits = item.get("hits")
+        if hits is not None and not hits.empty:
+            results.extend(str(p) for p in hits.product_id.tolist())
+
+    fallback = "whole_image" if first.get("used_whole_image") else None
+
+    try:
+        sql(f"""
+            INSERT INTO {CATALOG}.bronze.search_events (
+                event_id, event_ts, session_id, query_image, selected_category,
+                model_version, index_version, results_shown, clicked,
+                added_to_cart, latency_ms, n_results, reformulated,
+                query_condition, fallback_fired)
+            VALUES (
+                {_sql_str(event_id)}, current_timestamp(), {_sql_str(session_id)},
+                {_sql_str(remote)}, {_sql_str(first.get("detected_category"))},
+                {_sql_str(model_version)}, NULL,
+                {_sql_array(results)}, array(), array(),
+                {float(latency_ms)}, {len(results)}, false,
+                'live_upload', {_sql_str(fallback)})
+        """)
+        return event_id
+    except Exception as exc:
+        # Never let logging break a search. A missing row is a small loss; a
+        # failed search in front of a user is not.
+        print(f"could not log the search event: {exc}")
+        return None
+
+
+def log_click(event_id: str, product_id: str) -> None:
+    """
+    Record that somebody clicked a result.
+
+    This is what closes the feedback loop. A clicked result is a correctly
+    labelled positive pair, produced by a human who had every incentive to get
+    it right — and the results shown above it and passed over are hard
+    negatives, worth far more than random ones the model solved weeks ago.
+    """
+    if not event_id or not WAREHOUSE_ID:
+        return
+    try:
+        sql(f"""
+            UPDATE {CATALOG}.bronze.search_events
+            SET clicked = array_union(clicked, array({_sql_str(product_id)}))
+            WHERE event_id = {_sql_str(event_id)}
+        """)
+    except Exception as exc:
+        print(f"could not log the click: {exc}")
+
+
 # ----------------------------------------------------------------- volumes
 
 def read_volume_file(path: str) -> bytes | None:

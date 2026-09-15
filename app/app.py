@@ -24,6 +24,12 @@ import databricks_client as db
 
 st.set_page_config(page_title="FashionSearch", page_icon="🔍", layout="wide")
 
+# One id per browser session, so several searches by one person can be grouped
+# — which is what makes "did they search again immediately" measurable.
+if "session_id" not in st.session_state:
+    import uuid
+    st.session_state.session_id = uuid.uuid4().hex[:16]
+
 CATALOG = db.CATALOG
 
 
@@ -171,7 +177,10 @@ with tab_search:
         else:
             try:
                 with st.spinner("Calling the serving endpoint…"):
+                    import time as _time
+                    _t0 = _time.perf_counter()
                     items = search(uploaded.getvalue(), top_k, restrict)
+                    _elapsed = (_time.perf_counter() - _t0) * 1000
             except Exception as exc:
                 st.error(f"Search failed: {type(exc).__name__}: {exc}")
                 st.caption("Check the endpoint is running, and that "
@@ -181,6 +190,16 @@ with tab_search:
             if not items:
                 st.warning("The endpoint returned nothing.")
                 st.stop()
+
+            # Log the query once per uploaded image, not on every rerun —
+            # Streamlit re-executes the whole script on any widget change, and
+            # without this guard a single upload would write a row per click.
+            upload_key = f"{uploaded.name}:{uploaded.size}"
+            if st.session_state.get("logged_upload") != upload_key:
+                st.session_state.event_id = db.log_search_event(
+                    uploaded.getvalue(), items, _elapsed,
+                    st.session_state.session_id)
+                st.session_state.logged_upload = upload_key
 
             if len(items) == 1 and items[0].get("used_whole_image"):
                 # Worth surfacing: on the eval set this happened to 31% of
@@ -232,6 +251,14 @@ with tab_search:
                                     st.caption("(image not available)")
                                 st.caption(f"**{hit.score:.3f}** · {hit.category}")
                                 st.caption(hit.product_id)
+                                # A click is a correctly-labelled positive pair,
+                                # free. Everything shown above it and passed
+                                # over is a hard negative.
+                                if st.button("This one", key=f"c{n}_{hit.product_id}",
+                                             use_container_width=True):
+                                    db.log_click(st.session_state.get("event_id"),
+                                                 hit.product_id)
+                                    st.toast(f"Recorded {hit.product_id}")
                 st.divider()
 
 with tab_dashboard:
@@ -278,6 +305,27 @@ with tab_dashboard:
             chart["evaluated_at"] = pd.to_datetime(chart["evaluated_at"])
             st.line_chart(chart.set_index("evaluated_at")
                           [["recall_at_20", "ndcg_at_20"]])
+
+        st.subheader("Live searches")
+        st.caption(
+            "Every upload is stored in bronze.search_events, and the photo in "
+            "the raw.query_images volume. These are real production queries — "
+            "the thing the frozen eval set does not contain.")
+        try:
+            live = db.sql(f"""
+                SELECT event_ts, selected_category, n_results,
+                       round(latency_ms) AS latency_ms,
+                       size(clicked) AS clicks, fallback_fired, query_image
+                FROM {CATALOG}.bronze.search_events
+                ORDER BY event_ts DESC LIMIT 20
+            """)
+            if live.empty:
+                st.info("No searches logged yet. Upload a photo on the Search tab.")
+            else:
+                st.dataframe(live, use_container_width=True, hide_index=True)
+                st.caption(f"{len(live)} most recent. Query the table directly for all of them.")
+        except Exception as exc:
+            st.warning(f"Could not read search_events: {exc}")
 
         with st.expander("Serving history"):
             st.dataframe(serving_history(), use_container_width=True,
